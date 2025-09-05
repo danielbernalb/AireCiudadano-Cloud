@@ -14,7 +14,7 @@ spec:
     spec:
       containers:
         - name: mqttbroker
-          image: eclipse-mosquitto:1.6.14
+          image: eclipse-mosquitto:1.6.15
           command:
             - "/usr/sbin/mosquitto"
             - "-c"
