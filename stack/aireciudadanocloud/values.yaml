@@ -37,10 +37,10 @@ resources:
   pushgateway:
     requests:
       memory: "200Mi"
-      cpu: "250m"
+      cpu: "150m"
     limits:
       memory: "250Mi"
-      cpu: "350m"
+      cpu: "200m"
   prometheus:
     requests:
       memory: "1Gi"
@@ -65,10 +65,10 @@ resources:
   cleanercronjob:
     requests:
       memory: "150Mi"
-      cpu: "200m"
+      cpu: "100m"
     limits:
       memory: "200Mi"
-      cpu: "250m"
+      cpu: "150m"
   nginx:
     requests:
       memory: "150Mi"
