@@ -30,24 +30,24 @@ resources:
   mqttforward:
     requests:
       memory: "150Mi"
-      cpu: "150m"
+      cpu: "100m"
     limits:
       memory: "180Mi"
-      cpu: "200m"
+      cpu: "150m"
   pushgateway:
     requests:
       memory: "200Mi"
-      cpu: "250m"
+      cpu: "150m"
     limits:
       memory: "250Mi"
-      cpu: "350m"
+      cpu: "150m"
   prometheus:
     requests:
       memory: "1Gi"
-      cpu: "300m"
+      cpu: "250m"
     limits:
       memory: "1.5Gi"
-      cpu: "500m"
+      cpu: "400m"
   grafana:
     requests:
       memory: "400Mi"
@@ -58,17 +58,17 @@ resources:
   apiserver:
     requests:
       memory: "100Mi"
-      cpu: "80m"
+      cpu: "100m"
     limits:
       memory: "150Mi"
-      cpu: "100m"
+      cpu: "120m"
   cleanercronjob:
     requests:
       memory: "150Mi"
-      cpu: "200m"
+      cpu: "100m"
     limits:
       memory: "200Mi"
-      cpu: "250m"
+      cpu: "150m"
   nginx:
     requests:
       memory: "150Mi"
