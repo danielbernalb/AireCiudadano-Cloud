@@ -1,0 +1,173 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mqttforward
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mqttforward
+  template:
+    metadata:
+      labels:
+        app: mqttforward
+    spec:
+      containers:
+        - name: mqttforward
+          image: python
+          command: ["/bin/bash"]
+          args: ["-c","/config/run.sh"]
+          volumeMounts:
+            - name: mqttforward
+              mountPath: /config/
+          resources:
+            requests:
+              memory: "150Mi"
+              cpu: "100m"
+            limits:
+              memory: "180Mi"
+              cpu: "150m"
+      volumes:
+        - name: mqttforward
+          configMap:
+            name: mqttforward
+            defaultMode: 0777
+---
+kind: ConfigMap
+apiVersion: v1
+metadata:
+  name: mqttforward
+data:
+  run.sh: |
+    #!/bin/bash
+    set -e
+
+    # instalar deps solo al arrancar (no en cada crash)
+    pip install --no-cache-dir paho-mqtt requests pyyaml
+
+    while true; do
+      echo "Starting forwarder at $(date)"
+      python /config/pushgateway_forwarder.py pushgateway-np mqtt-np
+      echo "ERROR: Script failed, sleeping 2s before restart"
+      sleep 2
+    done
+    
+  pushgateway_forwarder.py: |
+    #!/usr/bin/env python3
+    import sys
+    import requests
+    import yaml
+    import json
+    import traceback
+    from paho.mqtt import client as mqtt
+    from urllib.parse import quote_plus
+    import time
+
+    HEADERS = {'X-Requested-With': 'Python requests',
+              'Content-type': 'text/plain; version=0.0.4; charset=utf-8'}
+
+    def pushdata(DATA, URL, retries=2):
+        for attempt in range(1, retries+2):
+            try:
+                response = requests.post(url=URL, data=DATA, headers=HEADERS, timeout=5)
+                print(f"PUSH to {URL} status: {response.status_code} content: {response.text!r}")
+                if response.status_code < 400:
+                    return True
+                else:
+                    print("WARN: pushgateway returned HTTP", response.status_code)
+            except Exception as e:
+                print("ERROR: Exception pushing data:", e)
+                traceback.print_exc()
+            if attempt <= retries:
+                print(f"Retrying push (attempt {attempt+1}) after 1s...")
+                time.sleep(1)
+        return False
+
+    def try_parse_payload(raw):
+        # raw is a str
+        # Try YAML, then JSON, otherwise return None
+        try:
+            parsed = yaml.safe_load(raw)
+            return parsed
+        except Exception as e_yaml:
+            # try JSON
+            try:
+                parsed = json.loads(raw)
+                return parsed
+            except Exception as e_json:
+                print("ERROR: parsing failed. YAML error:", e_yaml)
+                print("ERROR: JSON error:", e_json)
+                return None
+
+    def on_connect(client, userdata, flags, rc, properties=None):
+        print("MQTT connected, subscribing to 'measurement' with QoS=0")
+        client.subscribe([("measurement", 0)])  # QoS 0
+
+    def on_message(client, userdata, msg):
+        try:
+            raw = msg.payload.decode("utf-8", errors="replace")
+            print("Received on", msg.topic, "payload:", raw)
+            payload = try_parse_payload(raw)
+            if not isinstance(payload, dict):
+                print("ERROR: payload not dict after parsing; dropping. Raw:", raw)
+                return
+
+            device_id = payload.get('id')
+            if not device_id:
+                print("ERROR: no 'id' in payload:", payload)
+                return
+
+            def g(k): return payload.get(k, 0)
+            mapping = [
+                ('PM25','PM25'),('CO2','CO2'),('VOC','VOC'),('NOx','NOx'),
+                ('humidity','Humidity'),('temperature','Temperature'),
+                ('noisedba','Noise'),('RSSI','RSSI'),('latitude','Latitude'),
+                ('longitude','Longitude'),('inout','InOut'),('configval','ConfigVal'),
+                ('PM25raw','PM25raw'),('noisepeak','NoisePeak'),
+                ('PM251','PM251'),('PM252','PM252'),('PM1','PM1'),
+                ('mac','MAC'),('datavar1','Var1'),('datavar2','Var2')
+            ]
+            lines = []
+            for key, name in mapping:
+                val = g(key)
+                # normalize booleans/None
+                if val is None:
+                    val = 0
+                lines.append(f"{name} {val}")
+            msg_text = "\n".join(lines) + "\n"
+
+            encoded_id = quote_plus(str(device_id))
+            URL = f'http://{sys.argv[1]}:9091/metrics/job/{encoded_id}'
+            print("About to push for device", device_id, "URL:", URL, "payload:\n", msg_text)
+            success = pushdata(msg_text, URL)
+            if not success:
+                print("ERROR: push failed for device", device_id)
+        except Exception as e:
+            print("UNCAUGHT ERROR in on_message handler:", e)
+            traceback.print_exc()
+            # IMPORTANT: do not re-raise; swallow to keep client loop alive
+
+    def main():
+        if len(sys.argv) != 3:
+            print('Usage: '+sys.argv[0]+' <pushgateway service> <mqttbroker service>')
+            sys.exit(1)
+
+        pushgw = sys.argv[1]
+        mqttsvc = sys.argv[2]
+
+        # client_id + clean_session=False -> persistent session
+        client = mqtt.Client(client_id="mqttforwarder", clean_session=False)
+        client.on_connect = on_connect
+        client.on_message = on_message
+
+        # optional: set will/keepalive if desired
+        try:
+            client.connect(mqttsvc, 1883, keepalive=60)
+            print("Connected to MQTT broker at", mqttsvc)
+            client.loop_forever()
+        except Exception as e:
+            print("ERROR: can't connect to MQTT broker:", e)
+            traceback.print_exc()
+
+    if __name__ == "__main__":
+        main()
