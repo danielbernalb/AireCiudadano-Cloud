@@ -21,7 +21,12 @@ spec:
             - name: mqttforward
               mountPath: /config/
           resources:
-            {{- toYaml .Values.resources.mqttforward | nindent 12 }}
+            requests:
+              memory: "150Mi"
+              cpu: "100m"
+            limits:
+              memory: "180Mi"
+              cpu: "150m"
       volumes:
         - name: mqttforward
           configMap:
