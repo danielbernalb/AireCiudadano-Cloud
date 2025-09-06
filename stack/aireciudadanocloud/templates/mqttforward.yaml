@@ -27,6 +27,7 @@ spec:
           configMap:
             name: mqttforward
             defaultMode: 0777
+
 ---
 kind: ConfigMap
 apiVersion: v1
