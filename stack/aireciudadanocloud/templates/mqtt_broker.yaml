@@ -50,7 +50,11 @@ data:
   mosquitto.conf: |
     persistence true
     persistence_location /mosquitto/data/
+    # CAMBIO 1: Loguear a la salida estándar para que "kubectl logs" funcione
+    log_dest stdout
     log_dest file /mosquitto/log/mosquitto.log
+    # CAMBIO 2: Habilitar todos los tipos de log para máxima información
+    log_type all
     listener 1883
     allow_anonymous true
 ---
