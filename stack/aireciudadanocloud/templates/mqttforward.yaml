@@ -53,26 +53,34 @@ data:
 
     HEADERS = {'X-Requested-With': 'Python requests', 'Content-type': 'text/xml'}
 
-
     def pushdata(DATA, URL):
-      try:
-        #print(DATA)
-        response = requests.post(url=URL, data=DATA,headers=HEADERS)
-        print(response.content)
-      except requests.exceptions.RequestException as e:  # This is the correct syntax
-        raise SystemExit(e)
+        try:
+            print(f"--- Pushing Data to {URL} ---") # DEBUG: Muestra la URL
+            print(DATA) # DEBUG: Muestra los datos que se van a enviar
+            response = requests.post(url=URL, data=DATA, headers=HEADERS)
+            print(f"Pushgateway response: {response.status_code} - {response.content.decode('utf-8')}") # DEBUG: Muestra la respuesta del pushgateway
+        except requests.exceptions.RequestException as e:
+            print(f"ERROR pushing data: {e}") # DEBUG: Muestra error de conexión
+            raise SystemExit(e)
 
     def on_connect(client, userdata, flags, reason_code, properties):
-        # connect mqtt broker
+        print("Connected to MQTT Broker with result code " + str(reason_code))
         client.subscribe([("measurement", 0)])
-        
+
     def on_message(client, userdata, msg):
-        payload = msg.payload.decode("utf-8")
-        payload = yaml.safe_load(msg.payload.decode("utf-8"))
+        raw_payload = msg.payload.decode("utf-8")
+        print(f"\n--- Received Raw Message on topic '{msg.topic}' ---") # DEBUG: Muestra el mensaje crudo
+        print(raw_payload)
+
+        try:
+            payload = yaml.safe_load(raw_payload)
+        except yaml.YAMLError as e:
+            print(f"ERROR: Could not parse YAML. Error: {e}") # DEBUG: Error específico de YAML
+            return # Salir de la función si el mensaje no es YAML válido
 
         device_id = payload.pop('id', None)
         if device_id:
-            msg = 'PM25 ' + str(payload.pop('PM25', 0)) + '\n' + \
+            metrics_msg = 'PM25 ' + str(payload.pop('PM25', 0)) + '\n' + \
                   'CO2 ' + str(payload.pop('CO2', 0)) + '\n' + \
                   'VOC ' + str(payload.pop('VOC', 0)) + '\n' + \
                   'NOx ' + str(payload.pop('NOx', 0)) + '\n' + \
@@ -93,22 +101,26 @@ data:
                   'Var1 ' + str(payload.pop('datavar1', 0)) + '\n' + \
                   'Var2 ' + str(payload.pop('datavar2', 0)) + '\n'
 
-            URL  = 'http://' + sys.argv[1] + ':9091/metrics/job/' + str(device_id)
-            pushdata(msg, URL)
+            URL = f'http://{sys.argv[1]}:9091/metrics/job/{device_id}'
+            pushdata(metrics_msg, URL)
         else:
-            print( 'ERROR: Malformed message' + str(payload))
-        
+            print(f"ERROR: Malformed message - 'id' field is missing. Payload: {payload}")
 
+    # El resto del script (main, etc.) permanece igual...
     def main():
-      if (len(sys.argv) != 3):
-          print('Usage: '+sys.argv[0]+' <pushgateway IP> <mqttbroker IP>. Found '+len(sys.argv)+' arguments.')
-          exit()
-      
-      client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
-      client.connect(sys.argv[2], 1883)
-      client.on_connect = on_connect
-      client.on_message = on_message
-      client.loop_forever()
+        if (len(sys.argv) != 3):
+            print('Usage: '+sys.argv[0]+' <pushgateway IP> <mqttbroker IP>. Found '+str(len(sys.argv))+' arguments.')
+            exit()
+
+        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+        client.on_connect = on_connect
+        client.on_message = on_message
+        
+        try:
+            client.connect(sys.argv[2], 1883)
+            client.loop_forever()
+        except Exception as e:
+            print(f"ERROR connecting to MQTT or during loop: {e}")
 
     if __name__ == "__main__":
         main()
