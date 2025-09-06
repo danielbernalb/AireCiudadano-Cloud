@@ -61,8 +61,6 @@ data:
 
     def pushdata(DATA, URL):
         try:
-            print(f"--- Pushing Data to {URL} ---") # DEBUG: Muestra la URL
-            print(DATA) # DEBUG: Muestra los datos que se van a enviar
             response = requests.post(url=URL, data=DATA, headers=HEADERS)
             print(f"Pushgateway response: {response.status_code} - {response.content.decode('utf-8')}") # DEBUG: Muestra la respuesta del pushgateway
         except requests.exceptions.RequestException as e:
@@ -75,7 +73,6 @@ data:
 
     def on_message(client, userdata, msg):
         raw_payload = msg.payload.decode("utf-8")
-        print(f"\n--- Received Raw Message on topic '{msg.topic}' ---") # DEBUG: Muestra el mensaje crudo
         print(raw_payload)
 
         try:
