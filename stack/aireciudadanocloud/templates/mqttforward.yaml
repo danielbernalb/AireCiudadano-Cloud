@@ -14,25 +14,9 @@ spec:
     spec:
       containers:
         - name: mqttforward
-          # mejor usar una imagen basada en python slim; luego crea una imagen personalizada
-          image: python:3.11-slim
+          image: python
           command: ["/bin/bash"]
           args: ["-c","/config/run.sh"]
-          env:
-            - name: LOG_LEVEL
-              value: "INFO"
-            - name: REQUEST_TIMEOUT
-              value: "10.0"
-            - name: MAX_PUSH_RETRIES
-              value: "5"
-            - name: NUM_PUSH_WORKERS
-              value: "8"
-            - name: MSG_QUEUE_MAXSIZE
-              value: "50000"
-            - name: BATCH_MAX
-              value: "200"
-            - name: BATCH_TIMEOUT
-              value: "1.0"
           volumeMounts:
             - name: mqttforward
               mountPath: /config/
@@ -50,46 +34,40 @@ spec:
             defaultMode: 0777
 
 ---
-apiVersion: v1
 kind: ConfigMap
+apiVersion: v1
 metadata:
   name: mqttforward
 data:
   run.sh: |
     #!/bin/bash
     set -euo pipefail
-    # instalar deps (mejor: crear imagen con deps preinstaladas)
+    # instalar deps solo una vez al arranque (mejor: crear imagen con deps)
     pip install -q paho-mqtt requests pyyaml
-    # ejecutar el script con -u para que no haya buffering
+    # -u para evitar buffering de stdout en contenedor
     exec python -u /config/pushgateway_forwarder.py pushgateway-np mqtt-np
 
   pushgateway_forwarder.py: |
     #!/usr/bin/env python3
     import sys
-    import os
-    import time
-    import yaml
-    import queue
     import threading
+    import time
+    import queue
     import logging
+    import os
+    from concurrent.futures import ThreadPoolExecutor
     import requests
+    import yaml
+    from paho.mqtt import client as mqtt
 
-    # Config desde ENV
-    LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-    REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "10.0"))
-    MAX_PUSH_RETRIES = int(os.getenv("MAX_PUSH_RETRIES", "5"))
-    NUM_PUSH_WORKERS = int(os.getenv("NUM_PUSH_WORKERS", "8"))
-    MSG_QUEUE_MAXSIZE = int(os.getenv("MSG_QUEUE_MAXSIZE", "50000"))
-    BATCH_MAX = int(os.getenv("BATCH_MAX", "200"))
-    BATCH_TIMEOUT = float(os.getenv("BATCH_TIMEOUT", "1.0"))
-
-    logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(threadName)s %(message)s")
+    LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(
+        level=LOG_LEVEL,
+        format='%(asctime)s %(levelname)s %(threadName)s %(message)s'
+    )
     logger = logging.getLogger("mqttforwarder")
 
-    # Colas:
-    msg_queue = queue.Queue(maxsize=MSG_QUEUE_MAXSIZE)   # items: (device_id, payload_dict)
-    batch_queue = queue.Queue(maxsize=NUM_PUSH_WORKERS * 4)  # items: batch_payload_string
-
+    # Stats (thread-safe)
     class Stats:
         def __init__(self):
             self.lock = threading.Lock()
@@ -99,6 +77,7 @@ data:
             self.push_failed = 0
             self.malformed = 0
             self.dropped = 0
+
         def snapshot(self):
             with self.lock:
                 return {
@@ -112,195 +91,172 @@ data:
 
     stats = Stats()
 
-    # Construir lineas en formato Prometheus con label device="ID"
-    def build_metrics_lines(device_id, payload):
-        def val(k):
-            v = payload.get(k)
-            # asegúrate de devolver 0 o valor numérico
-            try:
-                return float(v) if v is not None else 0.0
-            except Exception:
-                try:
-                    return float(str(v))
-                except Exception:
-                    return 0.0
-        lines = []
-        # ejemplo de métricas (ajusta nombres si quieres)
-        lines.append(f'PM25{{device="{device_id}"}} {val("PM25")}')
-        lines.append(f'CO2{{device="{device_id}"}} {val("CO2")}')
-        lines.append(f'VOC{{device="{device_id}"}} {val("VOC")}')
-        lines.append(f'NOx{{device="{device_id}"}} {val("NOx")}')
-        lines.append(f'Humidity{{device="{device_id}"}} {val("humidity")}')
-        lines.append(f'Temperature{{device="{device_id}"}} {val("temperature")}')
-        lines.append(f'Noise{{device="{device_id}"}} {val("noisedba")}')
-        lines.append(f'RSSI{{device="{device_id}"}} {val("RSSI")}')
-        lines.append(f'Latitude{{device="{device_id}"}} {val("latitude")}')
-        lines.append(f'Longitude{{device="{device_id}"}} {val("longitude")}')
-        lines.append(f'InOut{{device="{device_id}"}} {val("inout")}')
-        lines.append(f'ConfigVal{{device="{device_id}"}} {val("configval")}')
-        lines.append(f'PM25raw{{device="{device_id}"}} {val("PM25raw")}')
-        lines.append(f'NoisePeak{{device="{device_id}"}} {val("noisepeak")}')
-        lines.append(f'PM251{{device="{device_id}"}} {val("PM251")}')
-        lines.append(f'PM252{{device="{device_id}"}} {val("PM252")}')
-        lines.append(f'PM1{{device="{device_id}"}} {val("PM1")}')
-        # Puedes añadir MAC y vars como labels o saltarlas si no son numéricas
-        return "\n".join(lines)
+    # Queue for messages to be pushed to Pushgateway
+    MSG_QUEUE_MAXSIZE = int(os.environ.get("MSG_QUEUE_MAXSIZE", "20000"))
+    msg_queue = queue.Queue(maxsize=MSG_QUEUE_MAXSIZE)
 
-    # Batcher: consume msg_queue y produce batches en batch_queue
-    def batcher_thread():
-        while True:
-            batch_lines = []
-            batch_count = 0
-            start = time.time()
-            while batch_count < BATCH_MAX and (time.time() - start) < BATCH_TIMEOUT:
-                try:
-                    device_id, payload = msg_queue.get(timeout=max(0.01, BATCH_TIMEOUT - (time.time() - start)))
-                    lines = build_metrics_lines(device_id, payload)
-                    batch_lines.append(lines)
-                    batch_count += 1
-                    msg_queue.task_done()
-                except queue.Empty:
-                    break
-                except Exception as e:
-                    logger.exception("Error processing message in batcher: %s", e)
-            if batch_lines:
-                # separamos batches por doble newline para que Prometheus parsee correctamente
-                payload = "\n\n".join(batch_lines) + "\n"
-                try:
-                    batch_queue.put_nowait(payload)
-                except queue.Full:
-                    # si batch_queue está full, contabilizamos dropped
-                    with stats.lock:
-                        stats.dropped += len(batch_lines)
-                    logger.error("batch_queue full: dropping batch of %d", len(batch_lines))
-            # inmediatamente continuar para armar siguiente batch
+    # Worker configuration
+    NUM_WORKERS = int(os.environ.get("NUM_PUSH_WORKERS", "5"))
+    REQUEST_TIMEOUT = float(os.environ.get("REQUEST_TIMEOUT", "5.0"))
+    MAX_RETRIES = int(os.environ.get("MAX_PUSH_RETRIES", "3"))
 
-    # Push worker: consume batches y los envía al pushgateway en un único POST
+    def build_metrics_message(payload):
+        # safe extractions with defaults
+        def p(k, default=0):
+            return payload.pop(k, default)
+        lines = [
+            f"PM25 {p('PM25',0)}",
+            f"CO2 {p('CO2',0)}",
+            f"VOC {p('VOC',0)}",
+            f"NOx {p('NOx',0)}",
+            f"Humidity {p('humidity',0)}",
+            f"Temperature {p('temperature',0)}",
+            f"Noise {p('noisedba',0)}",
+            f"RSSI {p('RSSI',0)}",
+            f"Latitude {p('latitude',0)}",
+            f"Longitude {p('longitude',0)}",
+            f"InOut {p('inout',0)}",
+            f"ConfigVal {p('configval',0)}",
+            f"PM25raw {p('PM25raw',0)}",
+            f"NoisePeak {p('noisepeak',0)}",
+            f"PM251 {p('PM251',0)}",
+            f"PM252 {p('PM252',0)}",
+            f"PM1 {p('PM1',0)}",
+            f"MAC {p('mac',0)}",
+            f"Var1 {p('datavar1',0)}",
+            f"Var2 {p('datavar2',0)}"
+        ]
+        return "\n".join(lines) + "\n"
+
     def push_worker(pushgateway_host):
         session = requests.Session()
-        headers = {'X-Requested-With': 'Python requests', 'Content-type': 'text/plain; version=0.0.4'}
-        url = f'http://{pushgateway_host}:9091/metrics/job/batch'
+        headers = {'X-Requested-With': 'Python requests', 'Content-type': 'text/xml'}
         while True:
+            device_id, metrics_msg, url = msg_queue.get()
             try:
-                payload = batch_queue.get()
+                # Retries with simple exponential backoff
                 success = False
-                for attempt in range(1, MAX_PUSH_RETRIES + 1):
+                for attempt in range(1, MAX_RETRIES+1):
                     try:
-                        resp = session.post(url=url, data=payload, headers=headers, timeout=REQUEST_TIMEOUT)
-                        logger.debug("push status %s", resp.status_code)
+                        resp = session.post(url=url, data=metrics_msg, headers=headers, timeout=REQUEST_TIMEOUT)
+                        logger.debug(f"Pushgateway attempt {attempt} for {device_id}: {resp.status_code}")
                         if 200 <= resp.status_code < 300:
                             success = True
                             with stats.lock:
                                 stats.pushed += 1
                             break
                         else:
-                            logger.warning("Non-2xx from pushgateway: %s - %s", resp.status_code, resp.content[:200])
+                            logger.warning(f"Non-2xx from pushgateway for {device_id}: {resp.status_code} - {resp.content[:200]!r}")
                     except requests.exceptions.RequestException as e:
-                        logger.warning("RequestException on attempt %d: %s", attempt, e)
+                        logger.warning(f"RequestException on attempt {attempt} for {device_id}: {e}")
                     # backoff
-                    time.sleep(0.5 * (2 ** (attempt - 1)))
+                    time.sleep(0.5 * (2 ** (attempt-1)))
                 if not success:
                     with stats.lock:
                         stats.push_failed += 1
-                    logger.error("Failed to push batch after %d attempts. Dropping.", MAX_PUSH_RETRIES)
+                    logger.error(f"Failed to push metrics for {device_id} after {MAX_RETRIES} attempts. Dropping.")
             except Exception as e:
-                logger.exception("Unexpected error in push_worker: %s", e)
+                logger.exception(f"Unexpected error in push_worker for {device_id}: {e}")
             finally:
-                try:
-                    batch_queue.task_done()
-                except Exception:
-                    pass
-
-    # Stats printer
-    def stats_printer():
-        while True:
-            time.sleep(60)
-            snap = stats.snapshot()
-            logger.info("STATS: received=%d queued=%d pushed=%d push_failed=%d malformed=%d dropped=%d queue_size=%d",
-                        snap["received"], snap["queued"], snap["pushed"], snap["push_failed"],
-                        snap["malformed"], snap["dropped"], msg_queue.qsize())
+                msg_queue.task_done()
 
     # MQTT callbacks
-    try:
-        from paho.mqtt import client as mqtt
-    except Exception as e:
-        logger.exception("Missing paho-mqtt lib: %s", e)
-        raise
-
-    def on_connect(client, userdata, flags, rc):
-        logger.info("Connected to MQTT Broker with result code %s", rc)
+    def on_connect(client, userdata, flags, rc, properties=None):
+        logger.info(f"Connected to MQTT Broker with result code {rc}")
+        # Subscribe with QoS 1 to reduce possible loss (publishers must support it)
         client.subscribe("measurement", qos=1)
 
     def on_message(client, userdata, msg):
         try:
-            raw = msg.payload.decode("utf-8", errors="replace")
+            raw_payload = msg.payload.decode("utf-8", errors="replace")
             with stats.lock:
                 stats.received += 1
-            logger.debug("raw payload: %s", raw[:1000])
+            # Rate-limit raw payload logging: only debug level
+            logger.debug(f"Raw payload from topic {msg.topic}: {raw_payload[:1000]}")
             try:
-                payload = yaml.safe_load(raw)
+                payload = yaml.safe_load(raw_payload)
             except yaml.YAMLError as e:
                 with stats.lock:
                     stats.malformed += 1
-                logger.warning("YAML parse error: %s", e)
+                logger.warning(f"Could not parse YAML: {e}; payload: {raw_payload[:200]}")
                 return
-            device_id = payload.pop("id", None)
+
+            device_id = payload.pop('id', None)
             if not device_id:
                 with stats.lock:
                     stats.malformed += 1
-                logger.warning("Missing id in payload keys: %s", list(payload.keys()))
+                logger.warning("Malformed message - 'id' missing. Payload keys: %s", list(payload.keys()))
                 return
-            # Encolar payload en msg_queue sin bloquear
+
+            metrics_msg = build_metrics_message(payload)
+            url = f'http://{sys.argv[1]}:9091/metrics/job/{device_id}'
+
+            # Encolar sin bloquear. Si la cola está llena, contar y descartar (evitar bloquear el callback)
             try:
-                msg_queue.put_nowait((device_id, payload))
+                msg_queue.put_nowait((device_id, metrics_msg, url))
                 with stats.lock:
                     stats.queued += 1
             except queue.Full:
                 with stats.lock:
                     stats.dropped += 1
-                logger.error("msg_queue FULL: dropping message from %s", device_id)
+                logger.error("MSG_QUEUE FULL: dropping message from %s", device_id)
         except Exception as e:
             logger.exception("Unexpected error in on_message: %s", e)
 
+    def stats_printer():
+        while True:
+            time.sleep(60)
+            snap = stats.snapshot()
+            # también podemos exponer esto por HTTP /metrics si quieres
+            logger.info("STATS: received=%d queued=%d pushed=%d push_failed=%d malformed=%d dropped=%d queue_size=%d",
+                        snap["received"], snap["queued"], snap["pushed"], snap["push_failed"],
+                        snap["malformed"], snap["dropped"], msg_queue.qsize())
+
     def main():
         if len(sys.argv) != 3:
-            print("Usage: {} <pushgateway host> <mqtt host>".format(sys.argv[0]))
+            print('Usage: '+sys.argv[0]+' <pushgateway host> <mqttbroker host>. Found '+str(len(sys.argv))+' arguments.')
             sys.exit(1)
+
         pushgateway_host = sys.argv[1]
         mqtt_host = sys.argv[2]
 
-        # Iniciar batcher
-        t = threading.Thread(target=batcher_thread, name="batcher", daemon=True)
-        t.start()
-
-        # Iniciar push workers
-        for i in range(NUM_PUSH_WORKERS):
-            t = threading.Thread(target=push_worker, args=(pushgateway_host,), name=f"push-worker-{i+1}", daemon=True)
+        # Start push workers
+        for i in range(NUM_WORKERS):
+            t = threading.Thread(target=push_worker, args=(pushgateway_host,), daemon=True, name=f"push-worker-{i+1}")
             t.start()
 
         # Stats thread
-        t_stats = threading.Thread(target=stats_printer, name="stats-printer", daemon=True)
+        t_stats = threading.Thread(target=stats_printer, daemon=True, name="stats-printer")
         t_stats.start()
 
-        # MQTT client
-        client = mqtt.Client()
+        client = mqtt.Client()  # usa defaults MQTTv3.1.1 (si necesitas v5 ajusta aquí)
         client.on_connect = on_connect
         client.on_message = on_message
 
+        # Tweaks to reduce loss & improve reconnect behavior
         try:
             client.reconnect_delay_set(min_delay=1, max_delay=120)
             try:
                 client.max_inflight_messages_set(1000)
             except Exception:
-                logger.debug("max_inflight not supported")
+                logger.debug("max_inflight_messages_set not supported in this paho version")
+            try:
+                client.max_queued_messages_set(0)  # no cola de salida (no estamos publicando por paho)
+            except Exception:
+                logger.debug("max_queued_messages_set not supported in this paho version")
+        except Exception:
+            logger.exception("Error setting client options")
+
+        try:
             client.connect(mqtt_host, 1883, keepalive=60)
             client.loop_start()
+            # Mantener proceso vivo
             while True:
                 time.sleep(1)
         except KeyboardInterrupt:
-            logger.info("Interrupted")
+            logger.info("Interrupted, stopping")
         except Exception as e:
-            logger.exception("MQTT connect/loop error: %s", e)
+            logger.exception(f"ERROR connecting to MQTT: {e}")
 
     if __name__ == "__main__":
         main()
