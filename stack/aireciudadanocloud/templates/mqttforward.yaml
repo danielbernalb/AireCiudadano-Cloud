@@ -21,322 +21,94 @@ spec:
             - name: mqttforward
               mountPath: /config/
           resources:
-            requests:
-              memory: "150Mi"
-              cpu: "100m"
-            limits:
-              memory: "180Mi"
-              cpu: "150m"
+            {{- toYaml .Values.resources.mqttforward | nindent 12 }}
       volumes:
         - name: mqttforward
           configMap:
             name: mqttforward
             defaultMode: 0777
-
-# mqttforward manifest with disk-backed SQLite queue + robust parser
-# - Uses SQLite to persist inbound messages so we don't drop on backlog
-# - on_message writes raw payload quickly to SQLite
-# - worker threads claim rows atomically (UPDATE ... WHERE id=? AND status='pending')
-# - robust parsing: normalize escaped sequences, parse YAML/JSON, fallback to brace/key:value parser
-# - extract numeric values robustly
-# Apply: kubectl apply -f mqttforward-sqlite-manifest.yaml
-
 ---
-apiVersion: v1
 kind: ConfigMap
+apiVersion: v1
 metadata:
   name: mqttforward
 data:
-  run.sh: |-
+  run.sh: |
     #!/bin/bash
-    set -e
-    pip install --no-cache-dir paho-mqtt requests pyyaml urllib3
-    echo "Starting sqlite-backed mqtt forwarder"
-    exec python /config/pushgateway_forwarder.py pushgateway-np mqtt-np /data/queue.db
-
-  pushgateway_forwarder.py: |-
-    #!/usr/bin/env python3
+    pip install paho-mqtt
+    pip install requests
+    pip install pyyaml
+    while ((1))
+    do 
+      python /config/pushgateway_forwarder.py pushgateway-np mqtt-np
+      echo "ERROR: Script failed"
+    done
+    
+  pushgateway_forwarder.py: |
+    #!/usr/bin/env python
     import sys
-    import time
-    import threading
-    import traceback
-    import sqlite3
-    import re
-    import json
-    import yaml
-    from urllib.parse import quote_plus
     import requests
-    from requests.adapters import HTTPAdapter
-    from urllib3.util.retry import Retry
-
-    # Config
-    WORKER_COUNT = 8
-    POST_TIMEOUT = 6
-    LOG_QUEUE_INTERVAL = 10
-    DB_PATH = None
-
-    HEADERS = {'X-Requested-With': 'Python requests',
-               'Content-type': 'text/plain; version=0.0.4; charset=utf-8'}
-
-    float_re = re.compile(r'[+-]?\d*\.?\d+(?:[eE][+-]?\d+)?')
-
-    def make_session(pool_maxsize=20):
-        s = requests.Session()
-        retries = Retry(total=3, backoff_factor=0.5, status_forcelist=(500,502,503,504))
-        adapter = HTTPAdapter(max_retries=retries, pool_connections=pool_maxsize, pool_maxsize=pool_maxsize)
-        s.mount('http://', adapter)
-        s.mount('https://', adapter)
-        return s
-
-    session = make_session()
-
-    def init_db(path):
-        conn = sqlite3.connect(path, timeout=30, check_same_thread=False)
-        conn.execute('PRAGMA journal_mode=WAL')
-        conn.execute('''CREATE TABLE IF NOT EXISTS queue (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            raw TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'pending',
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )''')
-        conn.commit()
-        return conn
-
-    def enqueue_raw(conn, raw):
-        conn.execute('INSERT INTO queue(raw, status) VALUES(?, "pending")', (raw,))
-        conn.commit()
-
-    def claim_row(conn):
-        # Attempt to atomically claim one pending row using UPDATE with subselect
-        cur = conn.execute("SELECT id FROM queue WHERE status='pending' ORDER BY id LIMIT 1")
-        row = cur.fetchone()
-        if not row:
-            return None
-        rowid = row[0]
-        res = conn.execute("UPDATE queue SET status='processing' WHERE id=? AND status='pending'", (rowid,))
-        conn.commit()
-        if res.rowcount == 1:
-            cur = conn.execute('SELECT id, raw FROM queue WHERE id=?', (rowid,))
-            return cur.fetchone()
-        return None
-
-    def delete_row(conn, rowid):
-        conn.execute('DELETE FROM queue WHERE id=?', (rowid,))
-        conn.commit()
-
-    def extract_first_float(value):
-        if value is None:
-            return None, value
-        if isinstance(value, (int, float)):
-            return float(value), value
-        if isinstance(value, (list, tuple)) and len(value) > 0:
-            return extract_first_float(value[0])
-        s = str(value)
-        s = s.replace(',', '.')
-        m = float_re.search(s)
-        if m:
-            try:
-                return float(m.group(0)), s
-            except Exception:
-                return None, s
-        return None, s
-
-    def normalize_escaped(raw):
-        if raw is None:
-            return raw
-        # Convert literal backslash sequences to real ones, and trim surrounding whitespace
-        try:
-            r = raw.replace('\\r\\n', '\r\n')
-            r = r.replace('\\n', '\n')
-            r = r.replace('\\r', '\r')
-            r = r.replace('\\t', '\t')
-            return r.strip()
-        except Exception:
-            return raw.strip()
-
-    def parse_brace_text(raw):
-        # Parse simple '{key: value, key2: value2}' formats where keys and unquoted string values exist
-        # Returns dict or None
-        try:
-            inner = raw.strip()
-            if inner.startswith('{') and inner.endswith('}'):
-                inner = inner[1:-1]
-            # split on comma, but values shouldn't contain commas in your data
-            parts = [p.strip() for p in inner.split(',') if p.strip()]
-            d = {}
-            for p in parts:
-                if ':' not in p:
-                    continue
-                k, v = p.split(':', 1)
-                k = k.strip()
-                v = v.strip()
-                # remove surrounding quotes if any
-                if (v.startswith("'") and v.endswith("'")) or (v.startswith('"') and v.endswith('"')):
-                    v = v[1:-1]
-                # try numeric
-                f, orig = extract_first_float(v)
-                if f is not None and v == orig:
-                    # it's purely numeric
-                    d[k] = f
-                else:
-                    d[k] = v
-            return d
-        except Exception:
-            return None
-
-    def try_parse_payload(raw):
-        # normalize escapes
-        raw2 = normalize_escaped(raw)
-        # Try YAML
-        try:
-            parsed = yaml.safe_load(raw2)
-            if isinstance(parsed, dict):
-                return parsed
-        except Exception:
-            pass
-        # Try JSON
-        try:
-            parsed = json.loads(raw2)
-            if isinstance(parsed, dict):
-                return parsed
-        except Exception:
-            pass
-        # Try custom brace parser
-        parsed = parse_brace_text(raw2)
-        return parsed
-
-    def build_metrics_from_parsed(parsed):
-        def g(k): return parsed.get(k, 0)
-        mapping = [
-            ('PM25','PM25'),('CO2','CO2'),('VOC','VOC'),('NOx','NOx'),
-            ('humidity','Humidity'),('temperature','Temperature'),
-            ('noisedba','Noise'),('RSSI','RSSI'),('latitude','Latitude'),
-            ('longitude','Longitude'),('inout','InOut'),('configval','ConfigVal'),
-            ('PM25raw','PM25raw'),('noisepeak','NoisePeak'),
-            ('PM251','PM251'),('PM252','PM252'),('PM1','PM1'),
-            ('mac','MAC'),('datavar1','Var1'),('datavar2','Var2')
-        ]
-        lines = []
-        device_id = parsed.get('id')
-        for key, name in mapping:
-            raw_val = parsed.get(key, 0)
-            f, original = extract_first_float(raw_val)
-            if f is None:
-                # default to 0 and log
-                print(f"COERCE WARNING: device={device_id} field={key} original={original!r} -> using 0")
-                f = 0
-            else:
-                if isinstance(original, str) and (str(f) not in original):
-                    print(f"COERCE INFO: device={device_id} field={key} original={original!r} -> {f}")
-            lines.append(f"{name} {f}")
-        return "\n".join(lines) + "\n"
-
-    def worker_loop(dbpath, pushgw_service):
-        conn = sqlite3.connect(dbpath, timeout=30, check_same_thread=False)
-        conn.execute('PRAGMA journal_mode=WAL')
-        sess = make_session()
-        while True:
-            try:
-                row = claim_row(conn)
-                if not row:
-                    time.sleep(0.1)
-                    continue
-                rowid, raw = row
-                parsed = try_parse_payload(raw)
-                if not isinstance(parsed, dict):
-                    print('Dropping unparsable raw in worker, id=', rowid, 'raw=', raw)
-                    delete_row(conn, rowid)
-                    continue
-                device_id = parsed.get('id')
-                if not device_id:
-                    print('Dropping parsed without id, id=', rowid, 'parsed=', parsed)
-                    delete_row(conn, rowid)
-                    continue
-                metrics = build_metrics_from_parsed(parsed)
-                url = f'http://{pushgw_service}:9091/metrics/job/{quote_plus(str(device_id))}'
-                ok = False
-                # try a few times
-                for attempt in range(3):
-                    try:
-                        r = sess.post(url=url, data=metrics, headers=HEADERS, timeout=POST_TIMEOUT)
-                        print('PUSH to', url, 'status:', r.status_code, 'len_resp:', len(r.text))
-                        if r.status_code < 400:
-                            ok = True
-                            break
-                        else:
-                            print('WARN: pushgateway returned', r.status_code, r.text)
-                    except Exception as e:
-                        print('ERROR pushing:', e)
-                        traceback.print_exc()
-                    time.sleep(0.5 + attempt)
-                if ok:
-                    delete_row(conn, rowid)
-                else:
-                    print('FINAL: failed to push for device', device_id, 'dropping after retries, rowid=', rowid)
-                    delete_row(conn, rowid)
-            except Exception as e:
-                print('Worker exception:', e)
-                traceback.print_exc()
-                time.sleep(1)
-
-    def queue_logger(dbpath):
-        conn = sqlite3.connect(dbpath, timeout=30, check_same_thread=False)
-        conn.execute('PRAGMA journal_mode=WAL')
-        while True:
-            cur = conn.execute("SELECT COUNT(1) FROM queue WHERE status='pending'")
-            n = cur.fetchone()[0]
-            print('QUEUE PENDING:', n)
-            time.sleep(LOG_QUEUE_INTERVAL)
-
-    # MQTT
     from paho.mqtt import client as mqtt
+    import yaml
 
-    def on_connect(client, userdata, flags, rc, properties=None):
-        print('MQTT connected, subscribing measurement (QoS 0)')
-        client.subscribe([('measurement', 0)])
+    HEADERS = {'X-Requested-With': 'Python requests', 'Content-type': 'text/xml'}
 
+
+    def pushdata(DATA, URL):
+      try:
+        #print(DATA)
+        response = requests.post(url=URL, data=DATA,headers=HEADERS)
+        print(response.content)
+      except requests.exceptions.RequestException as e:  # This is the correct syntax
+        raise SystemExit(e)
+
+    def on_connect(client, userdata, flags, reason_code, properties):
+        # connect mqtt broker
+        client.subscribe([("measurement", 0)])
+        
     def on_message(client, userdata, msg):
-        raw = msg.payload.decode('utf-8', errors='replace')
-        # Quick normalize native escapes but store raw (we keep normalization in worker too)
-        raw2 = raw.strip()
-        try:
-            # Use a separate short-lived connection to avoid threading issues with sqlite per callback
-            conn = sqlite3.connect(DB_PATH, timeout=30)
-            enqueue_raw(conn, raw2)
-            conn.close()
-        except Exception as e:
-            print('ERROR enqueueing raw:', e)
-            traceback.print_exc()
+        payload = msg.payload.decode("utf-8")
+        payload = yaml.safe_load(msg.payload.decode("utf-8"))
+
+        device_id = payload.pop('id', None)
+        if device_id:
+            msg = 'PM25 ' + str(payload.pop('PM25', 0)) + '\n' + \
+                  'CO2 ' + str(payload.pop('CO2', 0)) + '\n' + \
+                  'VOC ' + str(payload.pop('VOC', 0)) + '\n' + \
+                  'NOx ' + str(payload.pop('NOx', 0)) + '\n' + \
+                  'Humidity ' + str(payload.pop('humidity', 0)) + '\n' + \
+                  'Temperature ' + str(payload.pop('temperature', 0)) + '\n' + \
+                  'Noise ' + str(payload.pop('noisedba', 0)) + '\n' + \
+                  'RSSI ' + str(payload.pop('RSSI', 0)) + '\n' + \
+                  'Latitude ' + str(payload.pop('latitude', 0)) + '\n' + \
+                  'Longitude ' + str(payload.pop('longitude', 0)) + '\n' + \
+                  'InOut ' + str(payload.pop('inout', 0)) + '\n' + \
+                  'ConfigVal ' + str(payload.pop('configval', 0)) + '\n' + \
+                  'PM25raw ' + str(payload.pop('PM25raw', 0)) + '\n' + \
+                  'NoisePeak ' + str(payload.pop('noisepeak', 0)) + '\n' + \
+                  'PM251 ' + str(payload.pop('PM251', 0)) + '\n' + \
+                  'PM252 ' + str(payload.pop('PM252', 0)) + '\n' + \
+                  'PM1 ' + str(payload.pop('PM1', 0)) + '\n' + \
+                  'MAC ' + str(payload.pop('mac', 0)) + '\n' + \
+                  'Var1 ' + str(payload.pop('datavar1', 0)) + '\n' + \
+                  'Var2 ' + str(payload.pop('datavar2', 0)) + '\n'
+
+            URL  = 'http://' + sys.argv[1] + ':9091/metrics/job/' + str(device_id)
+            pushdata(msg, URL)
+        else:
+            print( 'ERROR: Malformed message' + str(payload))
+        
 
     def main():
-        global DB_PATH
-        if len(sys.argv) < 4:
-            print('Usage: pushgateway_service mqtt_service db_path')
-            sys.exit(1)
-        pushgw = sys.argv[1]
-        mqttsvc = sys.argv[2]
-        DB_PATH = sys.argv[3]
-        # init DB
-        conn = init_db(DB_PATH)
-        conn.close()
+      if (len(sys.argv) != 3):
+          print('Usage: '+sys.argv[0]+' <pushgateway IP> <mqttbroker IP>. Found '+len(sys.argv)+' arguments.')
+          exit()
+      
+      client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+      client.connect(sys.argv[2], 1883)
+      client.on_connect = on_connect
+      client.on_message = on_message
+      client.loop_forever()
 
-        # start workers
-        for i in range(WORKER_COUNT):
-            t = threading.Thread(target=worker_loop, args=(DB_PATH, pushgw), daemon=True)
-            t.start()
-        # queue logger
-        tl = threading.Thread(target=queue_logger, args=(DB_PATH,), daemon=True)
-        tl.start()
-
-        client = mqtt.Client(client_id='mqttforwarder', clean_session=False)
-        client.on_connect = on_connect
-        client.on_message = on_message
-        try:
-            client.connect(mqttsvc, 1883, keepalive=60)
-            client.loop_forever()
-        except Exception as e:
-            print('ERROR connecting mqtt:', e)
-            traceback.print_exc()
-
-    if __name__ == '__main__':
+    if __name__ == "__main__":
         main()
