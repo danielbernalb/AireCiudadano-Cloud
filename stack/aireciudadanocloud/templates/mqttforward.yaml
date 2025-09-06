@@ -32,92 +32,135 @@ spec:
           configMap:
             name: mqttforward
             defaultMode: 0777
+
 ---
-kind: ConfigMap
 apiVersion: v1
+kind: ConfigMap
 metadata:
   name: mqttforward
 data:
-  run.sh: |
+  run.sh: |-
     #!/bin/bash
     set -e
-
-    # instalar deps solo al arrancar (no en cada crash)
-    pip install --no-cache-dir paho-mqtt requests pyyaml
-
-    while true; do
-      echo "Starting forwarder at $(date)"
-      python /config/pushgateway_forwarder.py pushgateway-np mqtt-np
-      echo "ERROR: Script failed, sleeping 2s before restart"
-      sleep 2
-    done
-    
-  pushgateway_forwarder.py: |
+    pip install --no-cache-dir paho-mqtt requests pyyaml urllib3
+    echo "Starting enhanced mqtt forwarder"
+    exec python /config/pushgateway_forwarder.py pushgateway-np mqtt-np
+  pushgateway_forwarder.py: |-
     #!/usr/bin/env python3
     import sys
-    import requests
-    import yaml
-    import json
-    import traceback
-    from paho.mqtt import client as mqtt
-    from urllib.parse import quote_plus
     import time
+    import threading
+    import traceback
+    import queue
+    import json
+    import yaml
+    from urllib.parse import quote_plus
+    import requests
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
+
+    # Configuration
+    PUSH_RETRIES = 2
+    WORKER_COUNT = 4               # número de threads para enviar hacia Pushgateway
+    QUEUE_MAXSIZE = 2000          # tamaño máximo de cola (ajustable)
+    POST_TIMEOUT = 5
+    LOG_QUEUE_INTERVAL = 30       # cada cuántos segundos loguear el tamaño de la cola
 
     HEADERS = {'X-Requested-With': 'Python requests',
-              'Content-type': 'text/plain; version=0.0.4; charset=utf-8'}
+               'Content-type': 'text/plain; version=0.0.4; charset=utf-8'}
 
-    def pushdata(DATA, URL, retries=2):
-        for attempt in range(1, retries+2):
-            try:
-                response = requests.post(url=URL, data=DATA, headers=HEADERS, timeout=5)
-                print(f"PUSH to {URL} status: {response.status_code} content: {response.text!r}")
-                if response.status_code < 400:
-                    return True
-                else:
-                    print("WARN: pushgateway returned HTTP", response.status_code)
-            except Exception as e:
-                print("ERROR: Exception pushing data:", e)
-                traceback.print_exc()
-            if attempt <= retries:
-                print(f"Retrying push (attempt {attempt+1}) after 1s...")
-                time.sleep(1)
-        return False
+    q = queue.Queue(maxsize=QUEUE_MAXSIZE)
+
+    def make_session():
+        s = requests.Session()
+        retries = Retry(total=3, backoff_factor=0.5, status_forcelist=(500,502,503,504))
+        adapter = HTTPAdapter(max_retries=retries, pool_connections=WORKER_COUNT*2, pool_maxsize=WORKER_COUNT*2)
+        s.mount('http://', adapter)
+        s.mount('https://', adapter)
+        return s
+
+    session = make_session()
+
+    def pushdata(session, data, url):
+        # retries handled by session adapter; use small timeout
+        try:
+            r = session.post(url=url, data=data, headers=HEADERS, timeout=POST_TIMEOUT)
+            print(f"PUSH to {url} status: {r.status_code} len_resp: {len(r.text)}")
+            if r.status_code >= 400:
+                print("WARN: pushgateway returned", r.status_code, r.text)
+                return False
+            return True
+        except Exception as e:
+            print("ERROR push exception:", e)
+            traceback.print_exc()
+            return False
 
     def try_parse_payload(raw):
-        # raw is a str
-        # Try YAML, then JSON, otherwise return None
+        # Try YAML first, then JSON
+        if raw is None:
+            return None
         try:
             parsed = yaml.safe_load(raw)
             return parsed
         except Exception as e_yaml:
-            # try JSON
             try:
                 parsed = json.loads(raw)
                 return parsed
             except Exception as e_json:
-                print("ERROR: parsing failed. YAML error:", e_yaml)
-                print("ERROR: JSON error:", e_json)
+                # Logging both errors can be noisy; log raw and return None
+                print("PARSE FAILED. Raw:", raw)
                 return None
 
+    def worker_thread(pushgw_service):
+        sess = make_session()
+        while True:
+            item = q.get()
+            if item is None:
+                q.task_done()
+                break
+            device_id, metrics_text = item
+            encoded = quote_plus(str(device_id))
+            url = f'http://{pushgw_service}:9091/metrics/job/{encoded}'
+            ok = pushdata(sess, metrics_text, url)
+            if not ok:
+                # si falla, reintentar con backoff limitado
+                for i in range(2):
+                    time.sleep(1 + i)
+                    ok = pushdata(sess, metrics_text, url)
+                    if ok:
+                        break
+                if not ok:
+                    print("FINAL: failed to push for device", device_id, "dropping after retries")
+            q.task_done()
+
+    def queue_logger():
+        # logea el tamaño de la cola periódicamente
+        while True:
+            print("QUEUE SIZE:", q.qsize())
+            time.sleep(LOG_QUEUE_INTERVAL)
+
+    # MQTT handling
+    from paho.mqtt import client as mqtt
+
     def on_connect(client, userdata, flags, rc, properties=None):
-        print("MQTT connected, subscribing to 'measurement' with QoS=0")
-        client.subscribe([("measurement", 0)])  # QoS 0
+        print("MQTT connected, subscribing to 'measurement' (QoS 0)")
+        client.subscribe([("measurement", 0)])  # QoS 0 because transmitters don't support 1
 
     def on_message(client, userdata, msg):
         try:
-            raw = msg.payload.decode("utf-8", errors="replace")
-            print("Received on", msg.topic, "payload:", raw)
-            payload = try_parse_payload(raw)
-            if not isinstance(payload, dict):
-                print("ERROR: payload not dict after parsing; dropping. Raw:", raw)
+            raw = msg.payload.decode('utf-8', errors='replace')
+            parsed = try_parse_payload(raw)
+            if not isinstance(parsed, dict):
+                # drop but log
+                print("Dropping unparsable payload:", raw)
                 return
-
-            device_id = payload.get('id')
+            device_id = parsed.get('id')
             if not device_id:
-                print("ERROR: no 'id' in payload:", payload)
+                print("Dropping payload with no id:", parsed)
                 return
 
-            def g(k): return payload.get(k, 0)
+            # build metrics text
+            def g(k): return parsed.get(k, 0)
             mapping = [
                 ('PM25','PM25'),('CO2','CO2'),('VOC','VOC'),('NOx','NOx'),
                 ('humidity','Humidity'),('temperature','Temperature'),
@@ -130,43 +173,51 @@ data:
             lines = []
             for key, name in mapping:
                 val = g(key)
-                # normalize booleans/None
                 if val is None:
                     val = 0
                 lines.append(f"{name} {val}")
-            msg_text = "\n".join(lines) + "\n"
+            msg_text = "\\n".join(lines) + "\\n"
 
-            encoded_id = quote_plus(str(device_id))
-            URL = f'http://{sys.argv[1]}:9091/metrics/job/{encoded_id}'
-            print("About to push for device", device_id, "URL:", URL, "payload:\n", msg_text)
-            success = pushdata(msg_text, URL)
-            if not success:
-                print("ERROR: push failed for device", device_id)
+            try:
+                q.put_nowait((device_id, msg_text))
+            except queue.Full:
+                # Si la cola está llena, registrar y descartar (puedes ajustar QUEUE_MAXSIZE)
+                print("QUEUE FULL: dropping message for device", device_id)
         except Exception as e:
-            print("UNCAUGHT ERROR in on_message handler:", e)
+            print("UNCAUGHT error in on_message:", e)
             traceback.print_exc()
-            # IMPORTANT: do not re-raise; swallow to keep client loop alive
 
     def main():
         if len(sys.argv) != 3:
-            print('Usage: '+sys.argv[0]+' <pushgateway service> <mqttbroker service>')
+            print("Usage: pushgateway_service mqtt_service")
             sys.exit(1)
-
         pushgw = sys.argv[1]
         mqttsvc = sys.argv[2]
 
-        # client_id + clean_session=False -> persistent session
+        # lanzar workers
+        for i in range(WORKER_COUNT):
+            t = threading.Thread(target=worker_thread, args=(pushgw,), daemon=True)
+            t.start()
+
+        # start queue logger
+        tl = threading.Thread(target=queue_logger, daemon=True)
+        tl.start()
+
         client = mqtt.Client(client_id="mqttforwarder", clean_session=False)
         client.on_connect = on_connect
         client.on_message = on_message
 
-        # optional: set will/keepalive if desired
         try:
             client.connect(mqttsvc, 1883, keepalive=60)
-            print("Connected to MQTT broker at", mqttsvc)
-            client.loop_forever()
+            client.loop_start()  # background network thread
+            print("MQTT loop started")
+            # keep main alive
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print("Interrupted, shutting down")
         except Exception as e:
-            print("ERROR: can't connect to MQTT broker:", e)
+            print("ERROR connecting to mqtt:", e)
             traceback.print_exc()
 
     if __name__ == "__main__":
