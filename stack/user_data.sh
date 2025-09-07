@@ -24,7 +24,7 @@ done
 
 #===============Install K8s and helm3=======================
 #Create all in one kubernetes
-sudo snap install microk8s --classic --channel=1.28/stable
+sudo snap install microk8s --classic --channel=1.33/stable
 sudo usermod -a -G microk8s $USER
 sudo microk8s.enable dns
 sudo microk8s.enable helm3
