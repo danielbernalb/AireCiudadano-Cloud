@@ -92,13 +92,13 @@ data:
     stats = Stats()
 
     # Queue for messages to be pushed to Pushgateway
-    MSG_QUEUE_MAXSIZE = int(os.environ.get("MSG_QUEUE_MAXSIZE", "20000"))
+    MSG_QUEUE_MAXSIZE = int(os.environ.get("MSG_QUEUE_MAXSIZE", "50000"))
     msg_queue = queue.Queue(maxsize=MSG_QUEUE_MAXSIZE)
 
     # Worker configuration
-    NUM_WORKERS = int(os.environ.get("NUM_PUSH_WORKERS", "5"))
-    REQUEST_TIMEOUT = float(os.environ.get("REQUEST_TIMEOUT", "5.0"))
-    MAX_RETRIES = int(os.environ.get("MAX_PUSH_RETRIES", "3"))
+    NUM_WORKERS = int(os.environ.get("NUM_PUSH_WORKERS", "12"))
+    REQUEST_TIMEOUT = float(os.environ.get("REQUEST_TIMEOUT", "10.0"))
+    MAX_RETRIES = int(os.environ.get("MAX_PUSH_RETRIES", "5"))
 
     def build_metrics_message(payload):
         # safe extractions with defaults
@@ -163,8 +163,8 @@ data:
     # MQTT callbacks
     def on_connect(client, userdata, flags, rc, properties=None):
         logger.info(f"Connected to MQTT Broker with result code {rc}")
-        # Subscribe with QoS 1 to reduce possible loss (publishers must support it)
-        client.subscribe("measurement", qos=1)
+        # Subscribe with QoS 0
+        client.subscribe("measurement", qos=0)
 
     def on_message(client, userdata, msg):
         try:

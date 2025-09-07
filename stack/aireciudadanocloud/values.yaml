@@ -36,17 +36,17 @@ resources:
       cpu: "150m"
   pushgateway:
     requests:
-      memory: "200Mi"
-      cpu: "150m"
-    limits:
       memory: "250Mi"
-      cpu: "150m"
+      cpu: "350m"
+    limits:
+      memory: "350Mi"
+      cpu: "450m"
   prometheus:
     requests:
-      memory: "1Gi"
+      memory: "800Mi"
       cpu: "250m"
     limits:
-      memory: "1.5Gi"
+      memory: "1Gi"
       cpu: "400m"
   grafana:
     requests:
