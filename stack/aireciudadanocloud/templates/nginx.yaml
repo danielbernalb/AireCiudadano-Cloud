@@ -14,7 +14,7 @@ spec:
     spec:
       containers:
         - name: nginx
-          image: nginx:1.29.1-alpine
+          image: nginx:1.29.0-alpine
           {{- if eq .Values.tls true }}
           command: ["sh"]
           args: ["-c","/scripts/run.sh"]

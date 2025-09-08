@@ -3,10 +3,10 @@ kind: CronJob
 metadata:
   name: pushgateway-cleaner
 spec:
-  schedule: "*/10 * * * *"
+  schedule: "*/5 * * * *"
   jobTemplate:
     spec:
-      ttlSecondsAfterFinished: 120
+      ttlSecondsAfterFinished: 100
       template:
         spec:
           containers:
@@ -43,7 +43,7 @@ data:
     import time
     import sys
 
-    max_age = 10 #maximum age in minutes
+    max_age = 5 #maximum age in minutes
     PUSHGATEWAT_URL = sys.argv[1]
 
 
@@ -63,5 +63,3 @@ data:
 
     if __name__ == "__main__":
       main()
-
-

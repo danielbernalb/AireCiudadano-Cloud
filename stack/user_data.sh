@@ -24,12 +24,11 @@ done
 
 #===============Install K8s and helm3=======================
 #Create all in one kubernetes
-sudo snap install microk8s --classic --channel=1.25/stable
+sudo snap install microk8s --classic --channel=1.33/stable
 sudo usermod -a -G microk8s $USER
 sudo microk8s disable ha-cluster --force
 sudo microk8s.enable dns
 sudo microk8s.enable helm3
-
 echo "alias sudo='sudo '" >> $HOME/.bashrc
 echo "alias kubectl='microk8s.kubectl'" >> $HOME/.bashrc
 echo "alias helm='microk8s.helm3'" >> $HOME/.bashrc
@@ -37,7 +36,7 @@ echo "alias helm='microk8s.helm3'" >> $HOME/.bashrc
 
 #================Install anaire cloud stack=================
 cd $HOME
-git clone --branch cambios36_6sept2025 https://github.com/danielbernalb/aireciudadano-cloud.git
+git clone --branch cambios37_8sept2025 https://github.com/danielbernalb/aireciudadano-cloud.git
 ln -s anaire-cloud/stack/virtualbox/delete_stack.sh
 ln -s anaire-cloud/stack/virtualbox/upgrade_stack.sh
 ln -s anaire-cloud/stack/virtualbox/start_stack.sh
