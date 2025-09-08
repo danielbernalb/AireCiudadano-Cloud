@@ -80,6 +80,7 @@ echo "Added ${TARGET_USER} to group microk8s"
 # give microk8s services a moment to initialise
 sleep 6
 sudo microk8s status --wait-ready
+sudo microk8s disable ha-cluster
 sudo microk8s enable dns helm3
 
 # aliases for shell (for non-root user)
