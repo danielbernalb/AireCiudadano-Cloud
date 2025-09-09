@@ -59,116 +59,185 @@ spec:
 
 
 #!/usr/bin/env python3
-# mqtt_to_exporter.py
+"""
+mqtt_to_exporter_ordered.py
+
+- Map sensor keys to the same metric names used by pushgateway.
+- Keep numeric type behavior (ints vs floats) where possible; otherwise fallback to 0.
+- Expose only sensor metrics (no process/go/pushgateway internals).
+- Produce /metrics with metric names in alphabetical order and job lists sorted alphabetically.
+- Implement cleanup of stale jobs (STALENESS_SECONDS, default 300s) removing the labelsets.
+"""
+
 import os
 import time
 import yaml
 import threading
 from collections import defaultdict
-from prometheus_client import start_http_server, Gauge, Info
+import socket
+
+from prometheus_client.core import GaugeMetricFamily, CollectorRegistry
+from prometheus_client.exposition import make_wsgi_app, generate_latest
+from wsgiref.simple_server import make_server
+
 import paho.mqtt.client as mqtt
 
-# ---------------- CONFIG ----------------
+# ---------- Config ----------
 MQTT_BROKER = os.environ.get("MQTT_BROKER", "localhost")
-MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
+MQTT_PORT = int(os.environ.get("MQTT_PORT", "80"))
 MQTT_TOPIC = os.environ.get("MQTT_TOPIC", "measurement")
-EXPORTER_PORT = int(os.environ.get("EXPORTER_PORT", "30991"))
-STALENESS_SECONDS = int(os.environ.get("STALENESS_SECONDS", "300"))  # 5 minutes
-CLEANUP_INTERVAL = int(os.environ.get("CLEANUP_INTERVAL", "60"))    # cleanup check every 60s
-# ----------------------------------------
+EXPORTER_PORT = int(os.environ.get("EXPORTER_PORT", "30999"))
+STALENESS_SECONDS = int(os.environ.get("STALENESS_SECONDS", "300"))  # 5 min
+CLEANUP_INTERVAL = int(os.environ.get("CLEANUP_INTERVAL", "60"))
+# ---------------------------
 
-# dynamic gauges store: metric_name -> Gauge
-gauges = {}
-gauges_lock = threading.Lock()
+# Field mapping: sensor_key -> metric_name (exactly as in your Pushgateway output)
+FIELD_MAP = {
+    'PM25': 'PM25',
+    'PM25raw': 'PM25raw',
+    'PM251': 'PM251',
+    'PM252': 'PM252',
+    'PM1': 'PM1',
+    'VOC': 'VOC',
+    'NOx': 'NOx',
+    'humidity': 'Humidity',
+    'temperature': 'Temperature',
+    'RSSI': 'RSSI',
+    'latitude': 'Latitude',
+    'longitude': 'Longitude',
+    'inout': 'InOut',
+    'configval': 'ConfigVal',
+    'datavar1': 'Var1',
+    'datavar2': 'Var2',
+    'noisepeak': 'NoisePeak',
+    'noisedba': 'Noise',
+    # add more mappings if needed
+}
 
-# track last seen per device (job)
+# metrics_data: metric_name -> dict(job -> numeric_value)
+metrics_data = defaultdict(dict)
+metrics_lock = threading.Lock()
+
+# last_seen per job to implement cleanup (staleness)
 last_seen = {}
 last_seen_lock = threading.Lock()
 
-# info about exporter
-info = Info('mqtt_exporter_build_info', 'Exporter build info')
-info.info({'version': 'v1.0'})
+# ---------- Helpers ----------
+def map_field_name(key):
+    return FIELD_MAP.get(key, key)
 
-# Helper: create (or get) gauge with labels job & instance
-def get_or_create_gauge(name):
-    with gauges_lock:
-        if name in gauges:
-            return gauges[name]
-        # keep metric name exactly as in Pushgateway (case-sensitive)
-        g = Gauge(name, f'Auto-created metric {name}', ['job', 'instance'])
-        gauges[name] = g
-        return g
-
-# safe setter: convert value to float if possible, otherwise set 0
-def safe_set(metric, job, value):
-    try:
-        metric.labels(job=job, instance="").set(float(value))
-    except Exception:
-        # if conversion fails, set 0 (mimic existing behaviour)
+def to_number_preserve_type(val):
+    """
+    Try to preserve numeric types:
+    - if int-like -> return int
+    - elif float-like -> return float
+    - otherwise return 0 (fallback to mimic existing behavior)
+    """
+    if isinstance(val, bool):
+        # treat boolean as integer 0/1
+        return int(val)
+    if isinstance(val, int):
+        return val
+    if isinstance(val, float):
+        return val
+    # try conversions from strings
+    if isinstance(val, str):
         try:
-            metric.labels(job=job, instance="").set(0.0)
+            if '.' in val or 'e' in val.lower():
+                return float(val)
+            else:
+                return int(val)
         except Exception:
-            pass
+            # not a numeric string
+            return 0
+    # any other type: attempt float conversion
+    try:
+        return float(val)
+    except Exception:
+        return 0
 
-# process the parsed payload dict
-def process_payload(payload):
-    device_id = payload.get('id') or payload.get('ID') or payload.get('device')
-    if not device_id:
-        return
+def update_metrics_from_payload(device_id, payload):
+    """
+    payload: dict of sensor fields (already parsed)
+    """
     now = time.time()
-    # update last_seen
     with last_seen_lock:
         last_seen[device_id] = now
 
-    # iterate keys except 'id' and update gauges
-    for k, v in payload.items():
-        if k == 'id':
-            continue
-        metric_name = k  # keep same name as before (e.g., PM25, Temperature...)
-        g = get_or_create_gauge(metric_name)
-        safe_set(g, device_id, v)
+    with metrics_lock:
+        for k, v in payload.items():
+            if k == 'id':
+                continue
+            metric_name = map_field_name(k)
+            num = to_number_preserve_type(v)
+            # store numeric (int or float)
+            metrics_data[metric_name][device_id] = num
 
-# MQTT callbacks
+def remove_job_from_metrics(job):
+    with metrics_lock:
+        for metric in list(metrics_data.keys()):
+            # delete job entry if present
+            if job in metrics_data[metric]:
+                del metrics_data[metric][job]
+            # if metric has no jobs left, we can optionally delete the metric key
+            if not metrics_data[metric]:
+                del metrics_data[metric]
+
+# ---------- Collector ----------
+class OrderedMetricsCollector(object):
+    """
+    Custom collector that yields metrics sorted alphabetically by metric name,
+    and for each metric yields samples with jobs sorted alphabetically.
+    Labels order: instance, job (instance kept as empty string "" to match Pushgateway format).
+    """
+    def collect(self):
+        # metrics_data snapshot
+        with metrics_lock:
+            metric_items = {k: dict(v) for k, v in metrics_data.items()}
+
+        # iterate sorted metric names
+        for metric_name in sorted(metric_items.keys(), key=lambda s: s.lower()):
+            job_values = metric_items[metric_name]
+            # Build GaugeMetricFamily with labels [instance, job]
+            g = GaugeMetricFamily(metric_name, f'Auto-created metric {metric_name}', labels=['instance','job'])
+            # iterate jobs in alphabetical order
+            for job in sorted(job_values.keys(), key=lambda s: s.lower()):
+                value = job_values[job]
+                # ensure numeric type (prometheus expects number)
+                try:
+                    # keep integer vs float as close as possible; GaugeMetricFamily accepts float,
+                    # but generate_latest will format numbers reasonably (integers shown without decimal when possible).
+                    g.add_metric(["", job], value)
+                except Exception:
+                    # fallback: cast to float
+                    try:
+                        g.add_metric(["", job], float(value))
+                    except Exception:
+                        g.add_metric(["", job], 0.0)
+            yield g
+
+# ---------- MQTT handling ----------
 def on_connect(client, userdata, flags, rc, properties=None):
-    print("MQTT connected, subscribing to topic:", MQTT_TOPIC)
+    print("Connected to MQTT broker; subscribing to", MQTT_TOPIC)
     client.subscribe([(MQTT_TOPIC, 0)])
 
 def on_message(client, userdata, msg):
     try:
         raw = msg.payload.decode('utf-8')
         payload = yaml.safe_load(raw)
-        if isinstance(payload, dict):
-            process_payload(payload)
-        else:
-            print("Ignored non-dict payload:", raw[:200])
+        if not isinstance(payload, dict):
+            # ignore malformed payloads
+            return
+        # device id extraction (various possible keys)
+        device_id = payload.get('id') or payload.get('ID') or payload.get('device')
+        if not device_id:
+            # ignore malformed
+            return
+        update_metrics_from_payload(device_id, payload)
     except Exception as e:
-        print("Error parsing message:", e)
+        print("Error processing message:", e)
 
-# remove labelset (job) from all gauges (attempt true removal)
-def remove_job_labels(job):
-    with gauges_lock:
-        for name, g in list(gauges.items()):
-            try:
-                # prefer positional removal (job, instance)
-                g.remove(job, "")
-            except TypeError:
-                # some versions expect keyword args
-                try:
-                    g.remove(job=job, instance="")
-                except Exception:
-                    # fallback: set to 0 (this does not remove labelset but reduces values)
-                    try:
-                        g.labels(job=job, instance="").set(0)
-                    except Exception:
-                        pass
-            except Exception:
-                # generic fallback
-                try:
-                    g.labels(job=job, instance="").set(0)
-                except Exception:
-                    pass
-
-# cleanup thread: remove stale jobs
+# ---------- Cleanup thread ----------
 def cleanup_loop():
     while True:
         now = time.time()
@@ -180,30 +249,46 @@ def cleanup_loop():
         if to_remove:
             for job in to_remove:
                 print(f"Removing stale job: {job}")
-                remove_job_labels(job)
+                remove_job_from_metrics(job)
                 with last_seen_lock:
-                    # delete record of job
                     if job in last_seen:
                         del last_seen[job]
         time.sleep(CLEANUP_INTERVAL)
 
-def main():
-    # start HTTP server for prometheus scrape
-    start_http_server(EXPORTER_PORT)
-    print(f"Exporter listening on :{EXPORTER_PORT}, MQTT broker {MQTT_BROKER}:{MQTT_PORT}, topic '{MQTT_TOPIC}'")
+# ---------- WSGI server that exposes only our custom registry ----------
+def start_metrics_http_server(port, registry):
+    app = make_wsgi_app(registry)
+    httpd = make_server('', port, app)
+    print(f"Metrics HTTP server started on 0.0.0.0:{port}")
+    httpd.serve_forever()
 
-    # start cleanup thread
+# ---------- Main ----------
+def main():
+    # Prepare registry and register our custom collector only
+    registry = CollectorRegistry()
+    registry.register(OrderedMetricsCollector())
+
+    # Start HTTP server in a thread (serves only our registry: no process/go metrics)
+    http_thread = threading.Thread(target=start_metrics_http_server, args=(EXPORTER_PORT, registry), daemon=True)
+    http_thread.start()
+
+    # Start cleanup thread
     t = threading.Thread(target=cleanup_loop, daemon=True)
     t.start()
 
-    # setup MQTT
+    # Start MQTT client (blocking)
     client = mqtt.Client()
     client.on_connect = on_connect
     client.on_message = on_message
-    client.connect(MQTT_BROKER, MQTT_PORT, 60)
+    try:
+        client.connect(MQTT_BROKER, MQTT_PORT, 60)
+    except Exception as e:
+        print("Error connecting to MQTT broker:", e)
+        # If broker hostname resolves to same host and we want to wait, we keep retrying
+        # For now, exit
+        raise
+    print(f"Listening to MQTT broker {MQTT_BROKER}:{MQTT_PORT} topic '{MQTT_TOPIC}' and exposing metrics on :{EXPORTER_PORT}")
     client.loop_forever()
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
-
-
