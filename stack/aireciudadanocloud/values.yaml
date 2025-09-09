@@ -27,20 +27,13 @@ resources:
     limits:
       memory: "250Mi"
       cpu: "200m"
-  mqttforward:
-    requests:
-      memory: "150Mi"
-      cpu: "100m"
-    limits:
-      memory: "180Mi"
-      cpu: "150m"
-  pushgateway:
+  puushpython:
     requests:
       memory: "250Mi"
-      cpu: "350m"
+      cpu: "200m"
     limits:
-      memory: "350Mi"
-      cpu: "450m"
+      memory: "300Mi"
+      cpu: "300m"
   prometheus:
     requests:
       memory: "800Mi"
@@ -62,13 +55,6 @@ resources:
     limits:
       memory: "150Mi"
       cpu: "120m"
-  cleanercronjob:
-    requests:
-      memory: "150Mi"
-      cpu: "100m"
-    limits:
-      memory: "200Mi"
-      cpu: "150m"
   nginx:
     requests:
       memory: "150Mi"

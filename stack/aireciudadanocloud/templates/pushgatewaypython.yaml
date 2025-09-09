@@ -1,0 +1,209 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mqtt-metrics-exporter
+  labels:
+    app: mqtt-metrics-exporter
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mqtt-metrics-exporter
+  template:
+    metadata:
+      labels:
+        app: mqtt-metrics-exporter
+    spec:
+      containers:
+        - name: mqtt-metrics-exporter
+          image: tu-registry/aire-exporter:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: MQTT_BROKER
+              value: "mqttbroker"   # si tu mosquitto tiene Service 'mqttbroker'
+            - name: MQTT_PORT
+              value: "1883"
+            - name: MQTT_TOPIC
+              value: "measurement"
+            - name: EXPORTER_PORT
+              value: "30991"
+            - name: STALENESS_SECONDS
+              value: "300"
+            - name: CLEANUP_INTERVAL
+              value: "60"
+          ports:
+            - containerPort: 30991
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "200Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pushgatewaypython-np
+spec:
+  type: ClusterIP
+  selector:
+    app: pushgatewaypython
+  ports:
+    - port: 30991
+      targetPort: 30991
+      protocol: TCP
+
+---
+
+
+
+#!/usr/bin/env python3
+# mqtt_to_exporter.py
+import os
+import time
+import yaml
+import threading
+from collections import defaultdict
+from prometheus_client import start_http_server, Gauge, Info
+import paho.mqtt.client as mqtt
+
+# ---------------- CONFIG ----------------
+MQTT_BROKER = os.environ.get("MQTT_BROKER", "localhost")
+MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
+MQTT_TOPIC = os.environ.get("MQTT_TOPIC", "measurement")
+EXPORTER_PORT = int(os.environ.get("EXPORTER_PORT", "30991"))
+STALENESS_SECONDS = int(os.environ.get("STALENESS_SECONDS", "300"))  # 5 minutes
+CLEANUP_INTERVAL = int(os.environ.get("CLEANUP_INTERVAL", "60"))    # cleanup check every 60s
+# ----------------------------------------
+
+# dynamic gauges store: metric_name -> Gauge
+gauges = {}
+gauges_lock = threading.Lock()
+
+# track last seen per device (job)
+last_seen = {}
+last_seen_lock = threading.Lock()
+
+# info about exporter
+info = Info('mqtt_exporter_build_info', 'Exporter build info')
+info.info({'version': 'v1.0'})
+
+# Helper: create (or get) gauge with labels job & instance
+def get_or_create_gauge(name):
+    with gauges_lock:
+        if name in gauges:
+            return gauges[name]
+        # keep metric name exactly as in Pushgateway (case-sensitive)
+        g = Gauge(name, f'Auto-created metric {name}', ['job', 'instance'])
+        gauges[name] = g
+        return g
+
+# safe setter: convert value to float if possible, otherwise set 0
+def safe_set(metric, job, value):
+    try:
+        metric.labels(job=job, instance="").set(float(value))
+    except Exception:
+        # if conversion fails, set 0 (mimic existing behaviour)
+        try:
+            metric.labels(job=job, instance="").set(0.0)
+        except Exception:
+            pass
+
+# process the parsed payload dict
+def process_payload(payload):
+    device_id = payload.get('id') or payload.get('ID') or payload.get('device')
+    if not device_id:
+        return
+    now = time.time()
+    # update last_seen
+    with last_seen_lock:
+        last_seen[device_id] = now
+
+    # iterate keys except 'id' and update gauges
+    for k, v in payload.items():
+        if k == 'id':
+            continue
+        metric_name = k  # keep same name as before (e.g., PM25, Temperature...)
+        g = get_or_create_gauge(metric_name)
+        safe_set(g, device_id, v)
+
+# MQTT callbacks
+def on_connect(client, userdata, flags, rc, properties=None):
+    print("MQTT connected, subscribing to topic:", MQTT_TOPIC)
+    client.subscribe([(MQTT_TOPIC, 0)])
+
+def on_message(client, userdata, msg):
+    try:
+        raw = msg.payload.decode('utf-8')
+        payload = yaml.safe_load(raw)
+        if isinstance(payload, dict):
+            process_payload(payload)
+        else:
+            print("Ignored non-dict payload:", raw[:200])
+    except Exception as e:
+        print("Error parsing message:", e)
+
+# remove labelset (job) from all gauges (attempt true removal)
+def remove_job_labels(job):
+    with gauges_lock:
+        for name, g in list(gauges.items()):
+            try:
+                # prefer positional removal (job, instance)
+                g.remove(job, "")
+            except TypeError:
+                # some versions expect keyword args
+                try:
+                    g.remove(job=job, instance="")
+                except Exception:
+                    # fallback: set to 0 (this does not remove labelset but reduces values)
+                    try:
+                        g.labels(job=job, instance="").set(0)
+                    except Exception:
+                        pass
+            except Exception:
+                # generic fallback
+                try:
+                    g.labels(job=job, instance="").set(0)
+                except Exception:
+                    pass
+
+# cleanup thread: remove stale jobs
+def cleanup_loop():
+    while True:
+        now = time.time()
+        to_remove = []
+        with last_seen_lock:
+            for job, ts in list(last_seen.items()):
+                if (now - ts) > STALENESS_SECONDS:
+                    to_remove.append(job)
+        if to_remove:
+            for job in to_remove:
+                print(f"Removing stale job: {job}")
+                remove_job_labels(job)
+                with last_seen_lock:
+                    # delete record of job
+                    if job in last_seen:
+                        del last_seen[job]
+        time.sleep(CLEANUP_INTERVAL)
+
+def main():
+    # start HTTP server for prometheus scrape
+    start_http_server(EXPORTER_PORT)
+    print(f"Exporter listening on :{EXPORTER_PORT}, MQTT broker {MQTT_BROKER}:{MQTT_PORT}, topic '{MQTT_TOPIC}'")
+
+    # start cleanup thread
+    t = threading.Thread(target=cleanup_loop, daemon=True)
+    t.start()
+
+    # setup MQTT
+    client = mqtt.Client()
+    client.on_connect = on_connect
+    client.on_message = on_message
+    client.connect(MQTT_BROKER, MQTT_PORT, 60)
+    client.loop_forever()
+
+if __name__ == "__main__":
+    main()
+
+
