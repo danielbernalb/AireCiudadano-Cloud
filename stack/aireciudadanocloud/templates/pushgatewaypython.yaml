@@ -245,7 +245,8 @@ data:
             for sample in metric.samples:
                 # Formatear las etiquetas
                 # <-- cambio aquí para evitar '{{' que rompe Helm -->
-                labels = '{' + ','.join([f'{k}="{v}"' for k, v in sorted(sample.labels.items())]) + '}'
+                label_parts = [f'{k}="{v}"' for k, v in sorted(sample.labels.items())]
+                labels = '{' + ','.join(label_parts) + '}'
 
                 # Formatear el valor
                 value = sample.value
