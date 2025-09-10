@@ -17,11 +17,10 @@ spec:
       containers:
         - name: pushgatewaypython
           image: python
-          command: ["/bin/bash"]
-          args: ["-c","/config/run.sh"]
+          command: ["/bin/bash", "-c", "/config/run.sh"]
           volumeMounts:
-            - name: pushgatewaypython
-              mountPath: /config/
+            - name: config-volume
+              mountPath: /config
           env:
             - name: MQTT_BROKER
               value: "mqtt_broker"   # si tu mosquitto tiene Service 'mqttbroker'
@@ -37,6 +36,7 @@ spec:
               value: "60"
           ports:
             - containerPort: 30991
+              name: http-metrics
           resources:
             requests:
               memory: "250Mi"
@@ -44,18 +44,24 @@ spec:
             limits:
               memory: "350Mi"
               cpu: "300m"
+      # --- CORRECCIÓN CRÍTICA: Añadir la definición del volumen que usa el ConfigMap.
+      volumes:
+        - name: config-volume
+          configMap:
+            name: pushgatewaypython
+
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: pushgatewaypython-np
+  name: pushgatewaypython-svc
 spec:
   type: ClusterIP
   selector:
     app: pushgatewaypython
   ports:
     - port: 30991
-      targetPort: 30991
+      targetPort: http-metrics
       protocol: TCP
 
 ---
@@ -70,7 +76,7 @@ data:
     # instalar deps solo una vez al arranque (mejor: crear imagen con deps)
     pip install -q paho-mqtt pyyaml prometheus_client
     # -u para evitar buffering de stdout en contenedor
-    exec python -u /config/pushgatewaypython.py pushgatewaypython-np mqtt-np
+    exec python -u /config/pushgatewaypython.py
 
   pushgatewaypython.py: |
 
@@ -89,16 +95,16 @@ data:
 
     from prometheus_client.core import GaugeMetricFamily, CollectorRegistry
     # make_wsgi_app ya no es necesario, pero lo dejamos para no romper el import si se usa en otro lado
-    from prometheus_client.exposition import make_wsgi_app 
+    from prometheus_client.exposition import make_wsgi_app
     from wsgiref.simple_server import make_server
 
     import paho.mqtt.client as mqtt
 
     # ---------- Config ----------
     MQTT_BROKER = os.environ.get("MQTT_BROKER", "localhost")
-    MQTT_PORT = int(os.environ.get("MQTT_PORT", "80"))
+    MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
     MQTT_TOPIC = os.environ.get("MQTT_TOPIC", "measurement")
-    EXPORTER_PORT = int(os.environ.get("EXPORTER_PORT", "30999"))
+    EXPORTER_PORT = int(os.environ.get("EXPORTER_PORT", "30991"))
     STALENESS_SECONDS = int(os.environ.get("STALENESS_SECONDS", "300"))  # 5 min
     CLEANUP_INTERVAL = int(os.environ.get("CLEANUP_INTERVAL", "60"))
     # ---------------------------
