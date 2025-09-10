@@ -244,8 +244,9 @@ data:
             output.append(f'# TYPE {metric.name} {metric.type}')
             for sample in metric.samples:
                 # Formatear las etiquetas
-                labels = '{{{0}}}'.format(','.join([f'{k}="{v}"' for k, v in sorted(sample.labels.items())]))
-                
+                # <-- cambio aquí para evitar '{{' que rompe Helm -->
+                labels = '{' + ','.join([f'{k}="{v}"' for k, v in sorted(sample.labels.items())]) + '}'
+
                 # Formatear el valor
                 value = sample.value
                 formatted_value = ""
