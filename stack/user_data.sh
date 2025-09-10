@@ -12,7 +12,7 @@ export GRAFANA_ADMIN_PASSWORD="daniel2022"
 
 #==============Initialize /data if needed===================
 #Ensure there is a directory created for the applications persistent data
-for application in prometheus pushgateway grafana mosquitto letsencrypt
+for application in prometheus pushgatewaypython grafana mosquitto letsencrypt
 do
   if [ ! -d /data/$application ]; then
     sudo mkdir -p /data/$application
