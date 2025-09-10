@@ -80,12 +80,6 @@ data:
 
   pushgatewaypython.py: |
 
-  # - Map sensor keys to the same metric names used by pushgateway.
-    # - Keep numeric type behavior (ints vs floats) where possible; otherwise fallback to 0.
-    # - Expose only sensor metrics (no process/go/pushgateway internals).
-    # - Produce /metrics with metric names in alphabetical order and job lists sorted alphabetically.
-    # - Implement cleanup of stale jobs (STALENESS_SECONDS, default 300s) removing the labelsets.
-
     import os
     import time
     import yaml
