@@ -23,7 +23,7 @@ spec:
               mountPath: /config
           env:
             - name: MQTT_BROKER
-              value: "mqtt_broker"   # si tu mosquitto tiene Service 'mqttbroker'
+              value: "mqtt-np"   # si tu mosquitto tiene Service 'mqttbroker'
             - name: MQTT_PORT
               value: "1883"
             - name: MQTT_TOPIC
