@@ -79,7 +79,6 @@ data:
     exec python -u /config/pushgatewaypython.py
 
   pushgatewaypython.py: |
-
     import os
     import time
     import yaml
