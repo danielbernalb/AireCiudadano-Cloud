@@ -38,7 +38,12 @@ spec:
           ports:
             - containerPort: 30991
           resources:
-            {{- toYaml .Values.resources.pushgatewaypython | nindent 12 }}
+            requests:
+              memory: "250Mi"
+              cpu: "200m"
+            limits:
+              memory: "350Mi"
+              cpu: "300m"
 ---
 apiVersion: v1
 kind: Service
@@ -52,8 +57,6 @@ spec:
     - port: 30991
       targetPort: 30991
       protocol: TCP
-
----
 
 ---
 kind: ConfigMap
