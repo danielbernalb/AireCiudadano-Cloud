@@ -232,7 +232,7 @@ data:
                         if job in last_seen:
                             del last_seen[job]
 
-    # <<< CAMBIO 1: NUEVA FUNCIÓN PARA GENERAR EL TEXTO DE SALIDA MANUALMENTE >>>
+    # Nueva función para generar el texto de salida manualmente
     def generate_custom_metrics(registry):
         """
         Genera la salida de texto de Prometheus manualmente para controlar el formato de los números.
@@ -240,12 +240,13 @@ data:
         output = []
         # Usamos el generador del colector para obtener las métricas
         for metric in registry.collect():
-            output.append(f'# HELP {metric.name} {metric.documentation}')
-            output.append(f'# TYPE {metric.name} {metric.type}')
+            output.append('# HELP ' + metric.name + ' ' + metric.documentation)
+            output.append('# TYPE ' + metric.name + ' ' + metric.type)
             for sample in metric.samples:
-                # Formatear las etiquetas
-                # <-- cambio aquí para evitar '{{' que rompe Helm -->
-                label_parts = [f'{k}="{v}"' for k, v in sorted(sample.labels.items())]
+                # Formatear las etiquetas - CORREGIDO: usar concatenación de strings
+                label_parts = []
+                for k, v in sorted(sample.labels.items()):
+                    label_parts.append(k + '="' + str(v) + '"')
                 labels = '{' + ','.join(label_parts) + '}'
 
                 # Formatear el valor
@@ -260,11 +261,11 @@ data:
                 except (ValueError, TypeError):
                     formatted_value = str(value) # Fallback
 
-                output.append(f'{sample.name}{labels} {formatted_value}')
+                output.append(sample.name + labels + ' ' + formatted_value)
         
         return '\n'.join(output).encode('utf-8')
 
-    # <<< CAMBIO 2: MODIFICAR EL SERVIDOR HTTP PARA USAR NUESTRA FUNCIÓN >>>
+    # Modificar el servidor HTTP para usar nuestra función
     def start_metrics_http_server(port, registry):
         """
         Inicia un servidor WSGI que usa nuestra función de renderizado personalizado.
