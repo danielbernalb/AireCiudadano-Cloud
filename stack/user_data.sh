@@ -36,7 +36,7 @@ echo "alias helm='microk8s.helm3'" >> $HOME/.bashrc
 
 #================Install anaire cloud stack=================
 cd $HOME
-git clone --branch cambios37_8sept2025 https://github.com/danielbernalb/aireciudadano-cloud.git
+git clone --branch cambios38_9sept2025_k3s https://github.com/danielbernalb/aireciudadano-cloud.git
 ln -s anaire-cloud/stack/virtualbox/delete_stack.sh
 ln -s anaire-cloud/stack/virtualbox/upgrade_stack.sh
 ln -s anaire-cloud/stack/virtualbox/start_stack.sh
