@@ -27,12 +27,12 @@ resources:
     limits:
       memory: "250Mi"
       cpu: "200m"
-  puushpython:
+  pushgatewaypython:
     requests:
       memory: "250Mi"
       cpu: "200m"
     limits:
-      memory: "300Mi"
+      memory: "350Mi"
       cpu: "300m"
   prometheus:
     requests:

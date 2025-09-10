@@ -1,26 +1,30 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: mqtt-metrics-exporter
+  name: pushgatewaypython
   labels:
-    app: mqtt-metrics-exporter
+    app: pushgatewaypython
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: mqtt-metrics-exporter
+      app: pushgatewaypython
   template:
     metadata:
       labels:
-        app: mqtt-metrics-exporter
+        app: pushgatewaypython
     spec:
       containers:
-        - name: mqtt-metrics-exporter
-          image: tu-registry/aire-exporter:latest
-          imagePullPolicy: IfNotPresent
+        - name: pushgatewaypython
+          image: python
+          command: ["/bin/bash"]
+          args: ["-c","/config/run.sh"]
+          volumeMounts:
+            - name: pushgatewaypython
+              mountPath: /config/
           env:
             - name: MQTT_BROKER
-              value: "mqttbroker"   # si tu mosquitto tiene Service 'mqttbroker'
+              value: "mqtt_broker"   # si tu mosquitto tiene Service 'mqttbroker'
             - name: MQTT_PORT
               value: "1883"
             - name: MQTT_TOPIC
@@ -34,12 +38,7 @@ spec:
           ports:
             - containerPort: 30991
           resources:
-            requests:
-              cpu: "200m"
-              memory: "200Mi"
-            limits:
-              cpu: "500m"
-              memory: "512Mi"
+            {{- toYaml .Values.resources.pushgatewaypython | nindent 12 }}
 ---
 apiVersion: v1
 kind: Service
@@ -56,239 +55,246 @@ spec:
 
 ---
 
+---
+kind: ConfigMap
+apiVersion: v1
+metadata:
+  name: pushgatewaypython
+data:
+  run.sh: |
+    #!/bin/bash
+    set -euo pipefail
+    # instalar deps solo una vez al arranque (mejor: crear imagen con deps)
+    pip install -q paho-mqtt pyyaml prometheus_client
+    # -u para evitar buffering de stdout en contenedor
+    exec python -u /config/pushgatewaypython.py pushgatewaypython-np mqtt-np
 
+  pushgatewaypython.py: |
 
-#!/usr/bin/env python3
-"""
-mqtt_to_exporter_ordered.py
+  # - Map sensor keys to the same metric names used by pushgateway.
+  # - Keep numeric type behavior (ints vs floats) where possible; otherwise fallback to 0.
+  # - Expose only sensor metrics (no process/go/pushgateway internals).
+  # - Produce /metrics with metric names in alphabetical order and job lists sorted alphabetically.
+  # - Implement cleanup of stale jobs (STALENESS_SECONDS, default 300s) removing the labelsets.
 
-- Map sensor keys to the same metric names used by pushgateway.
-- Keep numeric type behavior (ints vs floats) where possible; otherwise fallback to 0.
-- Expose only sensor metrics (no process/go/pushgateway internals).
-- Produce /metrics with metric names in alphabetical order and job lists sorted alphabetically.
-- Implement cleanup of stale jobs (STALENESS_SECONDS, default 300s) removing the labelsets.
-"""
+    import os
+    import time
+    import yaml
+    import threading
+    from collections import defaultdict
+    import socket
 
-import os
-import time
-import yaml
-import threading
-from collections import defaultdict
-import socket
+    from prometheus_client.core import GaugeMetricFamily, CollectorRegistry
+    # make_wsgi_app ya no es necesario, pero lo dejamos para no romper el import si se usa en otro lado
+    from prometheus_client.exposition import make_wsgi_app 
+    from wsgiref.simple_server import make_server
 
-from prometheus_client.core import GaugeMetricFamily, CollectorRegistry
-from prometheus_client.exposition import make_wsgi_app, generate_latest
-from wsgiref.simple_server import make_server
+    import paho.mqtt.client as mqtt
 
-import paho.mqtt.client as mqtt
+    # ---------- Config ----------
+    MQTT_BROKER = os.environ.get("MQTT_BROKER", "localhost")
+    MQTT_PORT = int(os.environ.get("MQTT_PORT", "80"))
+    MQTT_TOPIC = os.environ.get("MQTT_TOPIC", "measurement")
+    EXPORTER_PORT = int(os.environ.get("EXPORTER_PORT", "30999"))
+    STALENESS_SECONDS = int(os.environ.get("STALENESS_SECONDS", "300"))  # 5 min
+    CLEANUP_INTERVAL = int(os.environ.get("CLEANUP_INTERVAL", "60"))
+    # ---------------------------
 
-# ---------- Config ----------
-MQTT_BROKER = os.environ.get("MQTT_BROKER", "localhost")
-MQTT_PORT = int(os.environ.get("MQTT_PORT", "80"))
-MQTT_TOPIC = os.environ.get("MQTT_TOPIC", "measurement")
-EXPORTER_PORT = int(os.environ.get("EXPORTER_PORT", "30999"))
-STALENESS_SECONDS = int(os.environ.get("STALENESS_SECONDS", "300"))  # 5 min
-CLEANUP_INTERVAL = int(os.environ.get("CLEANUP_INTERVAL", "60"))
-# ---------------------------
+    # Field mapping: sensor_key -> metric_name (exactly as in your Pushgateway output)
+    FIELD_MAP = {
+        'PM25': 'PM25',
+        'PM25raw': 'PM25raw',
+        'PM251': 'PM251',
+        'PM252': 'PM252',
+        'PM1': 'PM1',
+        'VOC': 'VOC',
+        'NOx': 'NOx',
+        'humidity': 'Humidity',
+        'temperature': 'Temperature',
+        'RSSI': 'RSSI',
+        'latitude': 'Latitude',
+        'longitude': 'Longitude',
+        'inout': 'InOut',
+        'configval': 'ConfigVal',
+        'datavar1': 'Var1',
+        'datavar2': 'Var2',
+        'noisepeak': 'NoisePeak',
+        'noisedba': 'Noise',
+    }
 
-# Field mapping: sensor_key -> metric_name (exactly as in your Pushgateway output)
-FIELD_MAP = {
-    'PM25': 'PM25',
-    'PM25raw': 'PM25raw',
-    'PM251': 'PM251',
-    'PM252': 'PM252',
-    'PM1': 'PM1',
-    'VOC': 'VOC',
-    'NOx': 'NOx',
-    'humidity': 'Humidity',
-    'temperature': 'Temperature',
-    'RSSI': 'RSSI',
-    'latitude': 'Latitude',
-    'longitude': 'Longitude',
-    'inout': 'InOut',
-    'configval': 'ConfigVal',
-    'datavar1': 'Var1',
-    'datavar2': 'Var2',
-    'noisepeak': 'NoisePeak',
-    'noisedba': 'Noise',
-    # add more mappings if needed
-}
+    # Definimos las métricas que deben ser enteros para el formateo final
+    METRICS_AS_INTEGER = {
+        'PM25', 'PM25raw', 'PM251', 'PM252', 'PM1', 'VOC', 'NOx', 'Humidity', 
+        'Temperature', 'RSSI', 'InOut', 'ConfigVal', 'Var1', 'Var2', 
+        'NoisePeak', 'Noise'
+    }
 
-# metrics_data: metric_name -> dict(job -> numeric_value)
-metrics_data = defaultdict(dict)
-metrics_lock = threading.Lock()
+    # metrics_data: metric_name -> dict(job -> numeric_value)
+    metrics_data = defaultdict(dict)
+    metrics_lock = threading.Lock()
 
-# last_seen per job to implement cleanup (staleness)
-last_seen = {}
-last_seen_lock = threading.Lock()
+    # last_seen per job to implement cleanup (staleness)
+    last_seen = {}
+    last_seen_lock = threading.Lock()
 
-# ---------- Helpers ----------
-def map_field_name(key):
-    return FIELD_MAP.get(key, key)
+    # ---------- Helpers ----------
+    def map_field_name(key):
+        return FIELD_MAP.get(key, key)
 
-def to_number_preserve_type(val):
-    """
-    Try to preserve numeric types:
-    - if int-like -> return int
-    - elif float-like -> return float
-    - otherwise return 0 (fallback to mimic existing behavior)
-    """
-    if isinstance(val, bool):
-        # treat boolean as integer 0/1
-        return int(val)
-    if isinstance(val, int):
-        return val
-    if isinstance(val, float):
-        return val
-    # try conversions from strings
-    if isinstance(val, str):
+    def to_number_preserve_type(val):
+        if isinstance(val, bool): return int(val)
+        if isinstance(val, (int, float)): return val
+        if isinstance(val, str):
+            try:
+                return float(val) if '.' in val or 'e' in val.lower() else int(val)
+            except (ValueError, TypeError):
+                return 0
         try:
-            if '.' in val or 'e' in val.lower():
-                return float(val)
-            else:
-                return int(val)
-        except Exception:
-            # not a numeric string
+            return float(val)
+        except (ValueError, TypeError):
             return 0
-    # any other type: attempt float conversion
-    try:
-        return float(val)
-    except Exception:
-        return 0
 
-def update_metrics_from_payload(device_id, payload):
-    """
-    payload: dict of sensor fields (already parsed)
-    """
-    now = time.time()
-    with last_seen_lock:
-        last_seen[device_id] = now
-
-    with metrics_lock:
-        for k, v in payload.items():
-            if k == 'id':
-                continue
-            metric_name = map_field_name(k)
-            num = to_number_preserve_type(v)
-            # store numeric (int or float)
-            metrics_data[metric_name][device_id] = num
-
-def remove_job_from_metrics(job):
-    with metrics_lock:
-        for metric in list(metrics_data.keys()):
-            # delete job entry if present
-            if job in metrics_data[metric]:
-                del metrics_data[metric][job]
-            # if metric has no jobs left, we can optionally delete the metric key
-            if not metrics_data[metric]:
-                del metrics_data[metric]
-
-# ---------- Collector ----------
-class OrderedMetricsCollector(object):
-    """
-    Custom collector that yields metrics sorted alphabetically by metric name,
-    and for each metric yields samples with jobs sorted alphabetically.
-    Labels order: instance, job (instance kept as empty string "" to match Pushgateway format).
-    """
-    def collect(self):
-        # metrics_data snapshot
+    def update_metrics_from_payload(device_id, payload):
+        now = time.time()
+        with last_seen_lock:
+            last_seen[device_id] = now
         with metrics_lock:
-            metric_items = {k: dict(v) for k, v in metrics_data.items()}
+            for k, v in payload.items():
+                if k == 'id': continue
+                metric_name = map_field_name(k)
+                num = to_number_preserve_type(v)
+                metrics_data[metric_name][device_id] = num
 
-        # iterate sorted metric names
-        for metric_name in sorted(metric_items.keys(), key=lambda s: s.lower()):
-            job_values = metric_items[metric_name]
-            # Build GaugeMetricFamily with labels [instance, job]
-            g = GaugeMetricFamily(metric_name, f'Auto-created metric {metric_name}', labels=['instance','job'])
-            # iterate jobs in alphabetical order
-            for job in sorted(job_values.keys(), key=lambda s: s.lower()):
-                value = job_values[job]
-                # ensure numeric type (prometheus expects number)
-                try:
-                    # keep integer vs float as close as possible; GaugeMetricFamily accepts float,
-                    # but generate_latest will format numbers reasonably (integers shown without decimal when possible).
-                    g.add_metric(["", job], value)
-                except Exception:
-                    # fallback: cast to float
+    def remove_job_from_metrics(job):
+        with metrics_lock:
+            for metric in list(metrics_data.keys()):
+                if job in metrics_data[metric]:
+                    del metrics_data[metric][job]
+                if not metrics_data[metric]:
+                    del metrics_data[metric]
+
+    # ---------- Collector ----------
+    class OrderedMetricsCollector(object):
+        def collect(self):
+            with metrics_lock:
+                metric_items = {k: dict(v) for k, v in metrics_data.items()}
+            for metric_name in sorted(metric_items.keys(), key=lambda s: s.lower()):
+                job_values = metric_items[metric_name]
+                g = GaugeMetricFamily(metric_name, f'Auto-created metric {metric_name}', labels=['instance','job'])
+                for job in sorted(job_values.keys(), key=lambda s: s.lower()):
+                    value = job_values[job]
                     try:
                         g.add_metric(["", job], float(value))
-                    except Exception:
+                    except (ValueError, TypeError):
                         g.add_metric(["", job], 0.0)
-            yield g
+                yield g
 
-# ---------- MQTT handling ----------
-def on_connect(client, userdata, flags, rc, properties=None):
-    print("Connected to MQTT broker; subscribing to", MQTT_TOPIC)
-    client.subscribe([(MQTT_TOPIC, 0)])
+    # ---------- MQTT handling ----------
+    def on_connect(client, userdata, flags, rc, properties=None):
+        print("Connected to MQTT broker; subscribing to", MQTT_TOPIC)
+        client.subscribe([(MQTT_TOPIC, 0)])
 
-def on_message(client, userdata, msg):
-    try:
-        raw = msg.payload.decode('utf-8')
-        payload = yaml.safe_load(raw)
-        if not isinstance(payload, dict):
-            # ignore malformed payloads
-            return
-        # device id extraction (various possible keys)
-        device_id = payload.get('id') or payload.get('ID') or payload.get('device')
-        if not device_id:
-            # ignore malformed
-            return
-        update_metrics_from_payload(device_id, payload)
-    except Exception as e:
-        print("Error processing message:", e)
+    def on_message(client, userdata, msg):
+        try:
+            raw = msg.payload.decode('utf-8')
+            payload = yaml.safe_load(raw)
+            if not isinstance(payload, dict): return
+            device_id = payload.get('id') or payload.get('ID') or payload.get('device')
+            if not device_id: return
+            update_metrics_from_payload(device_id, payload)
+        except Exception as e:
+            print("Error processing message:", e)
 
-# ---------- Cleanup thread ----------
-def cleanup_loop():
-    while True:
-        now = time.time()
-        to_remove = []
-        with last_seen_lock:
-            for job, ts in list(last_seen.items()):
-                if (now - ts) > STALENESS_SECONDS:
-                    to_remove.append(job)
-        if to_remove:
-            for job in to_remove:
-                print(f"Removing stale job: {job}")
-                remove_job_from_metrics(job)
-                with last_seen_lock:
-                    if job in last_seen:
-                        del last_seen[job]
-        time.sleep(CLEANUP_INTERVAL)
+    # ---------- Cleanup thread ----------
+    def cleanup_loop():
+        while True:
+            time.sleep(CLEANUP_INTERVAL)
+            now = time.time()
+            to_remove = []
+            with last_seen_lock:
+                for job, ts in list(last_seen.items()):
+                    if (now - ts) > STALENESS_SECONDS:
+                        to_remove.append(job)
+            if to_remove:
+                for job in to_remove:
+                    print(f"Removing stale job: {job}")
+                    remove_job_from_metrics(job)
+                    with last_seen_lock:
+                        if job in last_seen:
+                            del last_seen[job]
 
-# ---------- WSGI server that exposes only our custom registry ----------
-def start_metrics_http_server(port, registry):
-    app = make_wsgi_app(registry)
-    httpd = make_server('', port, app)
-    print(f"Metrics HTTP server started on 0.0.0.0:{port}")
-    httpd.serve_forever()
+    # <<< CAMBIO 1: NUEVA FUNCIÓN PARA GENERAR EL TEXTO DE SALIDA MANUALMENTE >>>
+    def generate_custom_metrics(registry):
+        """
+        Genera la salida de texto de Prometheus manualmente para controlar el formato de los números.
+        """
+        output = []
+        # Usamos el generador del colector para obtener las métricas
+        for metric in registry.collect():
+            output.append(f'# HELP {metric.name} {metric.documentation}')
+            output.append(f'# TYPE {metric.name} {metric.type}')
+            for sample in metric.samples:
+                # Formatear las etiquetas
+                labels = '{{{0}}}'.format(','.join([f'{k}="{v}"' for k, v in sorted(sample.labels.items())]))
+                
+                # Formatear el valor
+                value = sample.value
+                formatted_value = ""
+                try:
+                    # Si es una métrica de nuestra lista y es un número entero...
+                    if sample.name in METRICS_AS_INTEGER and float(value) == int(float(value)):
+                        formatted_value = str(int(float(value))) # ...la formateamos como entero
+                    else:
+                        formatted_value = str(value) # ...si no, como viene
+                except (ValueError, TypeError):
+                    formatted_value = str(value) # Fallback
 
-# ---------- Main ----------
-def main():
-    # Prepare registry and register our custom collector only
-    registry = CollectorRegistry()
-    registry.register(OrderedMetricsCollector())
+                output.append(f'{sample.name}{labels} {formatted_value}')
+        
+        return '\n'.join(output).encode('utf-8')
 
-    # Start HTTP server in a thread (serves only our registry: no process/go metrics)
-    http_thread = threading.Thread(target=start_metrics_http_server, args=(EXPORTER_PORT, registry), daemon=True)
-    http_thread.start()
+    # <<< CAMBIO 2: MODIFICAR EL SERVIDOR HTTP PARA USAR NUESTRA FUNCIÓN >>>
+    def start_metrics_http_server(port, registry):
+        """
+        Inicia un servidor WSGI que usa nuestra función de renderizado personalizado.
+        """
+        def app(environ, start_response):
+            # Generar la salida con nuestro formateador personalizado
+            data = generate_custom_metrics(registry)
+            
+            status = '200 OK'
+            headers = [
+                ('Content-Type', 'text/plain; version=0.0.4; charset=utf-8'),
+                ('Content-Length', str(len(data)))
+            ]
+            start_response(status, headers)
+            return [data]
 
-    # Start cleanup thread
-    t = threading.Thread(target=cleanup_loop, daemon=True)
-    t.start()
+        httpd = make_server('', port, app)
+        print(f"Metrics HTTP server started on 0.0.0.0:{port}")
+        httpd.serve_forever()
 
-    # Start MQTT client (blocking)
-    client = mqtt.Client()
-    client.on_connect = on_connect
-    client.on_message = on_message
-    try:
-        client.connect(MQTT_BROKER, MQTT_PORT, 60)
-    except Exception as e:
-        print("Error connecting to MQTT broker:", e)
-        # If broker hostname resolves to same host and we want to wait, we keep retrying
-        # For now, exit
-        raise
-    print(f"Listening to MQTT broker {MQTT_BROKER}:{MQTT_PORT} topic '{MQTT_TOPIC}' and exposing metrics on :{EXPORTER_PORT}")
-    client.loop_forever()
+    # ---------- Main ----------
+    def main():
+        registry = CollectorRegistry()
+        registry.register(OrderedMetricsCollector())
 
-if __name__ == '__main__':
-    main()
+        http_thread = threading.Thread(target=start_metrics_http_server, args=(EXPORTER_PORT, registry), daemon=True)
+        http_thread.start()
+
+        t = threading.Thread(target=cleanup_loop, daemon=True)
+        t.start()
+
+        client = mqtt.Client()
+        client.on_connect = on_connect
+        client.on_message = on_message
+        try:
+            client.connect(MQTT_BROKER, MQTT_PORT, 60)
+        except Exception as e:
+            print("Error connecting to MQTT broker:", e)
+            raise
+        print(f"Listening to MQTT broker {MQTT_BROKER}:{MQTT_PORT} topic '{MQTT_TOPIC}' and exposing metrics on :{EXPORTER_PORT}")
+        client.loop_forever()
+
+    if __name__ == '__main__':
+        main()
