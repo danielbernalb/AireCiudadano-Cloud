@@ -26,7 +26,7 @@ done
 #Create all in one kubernetes
 sudo snap install microk8s --classic --channel=1.33/stable
 sudo usermod -a -G microk8s $USER
-#sudo microk8s disable ha-cluster --force
+sudo microk8s disable ha-cluster --force
 sudo microk8s.enable dns
 sudo microk8s.enable helm3
 echo "alias sudo='sudo '" >> $HOME/.bashrc
