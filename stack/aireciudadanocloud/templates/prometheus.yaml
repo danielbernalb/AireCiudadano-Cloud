@@ -9,12 +9,10 @@ data:
     global:
       scrape_interval: 60s
       evaluation_interval: 180s
-
     scrape_configs:
       - job_name: 'pushgatewaypython'
-
         static_configs:
-          - targets: ['pushgatewaypython-np:9091']
+          - targets: ['pushgatewaypython-svc:30991']
 ---
 apiVersion: apps/v1
 kind: Deployment
