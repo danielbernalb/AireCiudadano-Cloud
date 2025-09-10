@@ -38,7 +38,12 @@ spec:
             - containerPort: 30991
               name: http-metrics
           resources:
-            {{- toYaml .Values.resources.pushgatewaypython | nindent 12 }}
+            requests:
+              memory: "250Mi"
+              cpu: "200m"
+            limits:
+              memory: "350Mi"
+              cpu: "300m"
       # --- CORRECCIÓN CRÍTICA: Añadir la definición del volumen que usa el ConfigMap.
       volumes:
         - name: config-volume
