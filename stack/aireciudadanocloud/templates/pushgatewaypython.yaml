@@ -1,21 +1,21 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: pushgatewaypython
+  name: pushgateway
   labels:
-    app: pushgatewaypython
+    app: pushgateway
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: pushgatewaypython
+      app: pushgateway
   template:
     metadata:
       labels:
-        app: pushgatewaypython
+        app: pushgateway
     spec:
       containers:
-        - name: pushgatewaypython
+        - name: pushgateway
           image: python
           command: ["/bin/bash", "-c", "/config/run.sh"]
           volumeMounts:
@@ -23,19 +23,19 @@ spec:
               mountPath: /config
           env:
             - name: MQTT_BROKER
-              value: "mqtt-np"   # si tu mosquitto tiene Service 'mqttbroker'
+              value: "mqtt-np"
             - name: MQTT_PORT
               value: "1883"
             - name: MQTT_TOPIC
               value: "measurement"
             - name: EXPORTER_PORT
-              value: "30991"
+              value: "9091"
             - name: STALENESS_SECONDS
               value: "300"
             - name: CLEANUP_INTERVAL
               value: "60"
           ports:
-            - containerPort: 30991
+            - containerPort: 9091
               name: http-metrics
           resources:
             requests:
@@ -44,24 +44,23 @@ spec:
             limits:
               memory: "350Mi"
               cpu: "300m"
-      # --- CORRECCIÓN CRÍTICA: Añadir la definición del volumen que usa el ConfigMap.
       volumes:
         - name: config-volume
           configMap:
-            name: pushgatewaypython
+            name: pushgateway
             defaultMode: 0755
 
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: pushgatewaypython-svc
+  name: pushgateway-np
 spec:
   type: ClusterIP
   selector:
-    app: pushgatewaypython
+    app: pushgateway
   ports:
-    - port: 30991
+    - port: 9091
       targetPort: http-metrics
       protocol: TCP
 
@@ -69,7 +68,7 @@ spec:
 kind: ConfigMap
 apiVersion: v1
 metadata:
-  name: pushgatewaypython
+  name: pushgateway
 data:
   run.sh: |
     #!/bin/bash
@@ -98,7 +97,7 @@ data:
     MQTT_BROKER = os.environ.get("MQTT_BROKER", "localhost")
     MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
     MQTT_TOPIC = os.environ.get("MQTT_TOPIC", "measurement")
-    EXPORTER_PORT = int(os.environ.get("EXPORTER_PORT", "30991"))
+    EXPORTER_PORT = int(os.environ.get("EXPORTER_PORT", "9091"))
     STALENESS_SECONDS = int(os.environ.get("STALENESS_SECONDS", "300"))  # 5 min
     CLEANUP_INTERVAL = int(os.environ.get("CLEANUP_INTERVAL", "60"))
     # ---------------------------
