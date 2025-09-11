@@ -21,7 +21,7 @@ done
 
 #===============Install K3s=======================
 # Instalar K3s
-curl -sfL https://get.k3s.io | sh -s - --write-kubeconfig-mode 644
+curl -sfL https://get.k3s.io | sh -s - --write-kubeconfig-mode 644 --disable=traefik --disable=servicelb
 
 # Configurar kubectl
 echo "export KUBECONFIG=/etc/rancher/k3s/k3s.yaml" >> $HOME/.bashrc
