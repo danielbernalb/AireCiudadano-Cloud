@@ -20,8 +20,13 @@ do
 done
 
 #===============Install K3s=======================
-# Instalar K3s
-curl -sfL https://get.k3s.io | sh -s - --write-kubeconfig-mode 644 --disable=traefik --disable=servicelb
+curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="server --disable=traefik --disable=servicelb --write-kubeconfig-mode 644" sh -
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+
+# Esperas de readiness
+kubectl wait --for=condition=Ready node --all --timeout=180s
+kubectl -n kube-system rollout status deploy/coredns --timeout=180s || true
+kubectl -n kube-system rollout status deploy/local-path-provisioner --timeout=180s || true
 
 # Configurar kubectl
 echo "export KUBECONFIG=/etc/rancher/k3s/k3s.yaml" >> $HOME/.bashrc
