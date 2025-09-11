@@ -49,11 +49,8 @@ metadata:
 data:
   run.sh: |
     #!/bin/bash
-    pip install paho-mqtt
-    pip install requests
-    pip install pyyaml
-    pip install bottle
-    pip install unidecode
+    set -euo pipefail
+    pip install -q paho-mqtt requests pyyaml bottle unidecode
     pip install -U grafana_api
     cd /root/
     git clone https://github.com/danielbernalb/aireciudadano-cloud.git
