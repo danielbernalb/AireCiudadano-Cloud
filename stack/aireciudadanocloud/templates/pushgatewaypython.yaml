@@ -38,12 +38,7 @@ spec:
             - containerPort: 9091
               name: http-metrics
           resources:
-            requests:
-              memory: "250Mi"
-              cpu: "200m"
-            limits:
-              memory: "350Mi"
-              cpu: "300m"
+            {{- toYaml .Values.resources.pushgatewaypython | nindent 12 }}
       volumes:
         - name: config-volume
           configMap:
