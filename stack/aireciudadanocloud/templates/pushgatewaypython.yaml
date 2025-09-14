@@ -51,13 +51,14 @@ kind: Service
 metadata:
   name: pushgateway-np
 spec:
-  type: ClusterIP
+  type: NodePort
   selector:
     app: pushgateway
   ports:
     - port: 9091
       targetPort: http-metrics
       protocol: TCP
+      nodePort: 30991
 
 ---
 kind: ConfigMap
@@ -79,10 +80,8 @@ data:
     import yaml
     import threading
     from collections import defaultdict
-    import socket
 
     from prometheus_client.core import GaugeMetricFamily, CollectorRegistry
-    # make_wsgi_app ya no es necesario, pero lo dejamos para no romper el import si se usa en otro lado
     from prometheus_client.exposition import make_wsgi_app
     from wsgiref.simple_server import make_server
 
@@ -97,7 +96,6 @@ data:
     CLEANUP_INTERVAL = int(os.environ.get("CLEANUP_INTERVAL", "60"))
     # ---------------------------
 
-    # Field mapping: sensor_key -> metric_name (exactly as in your Pushgateway output)
     FIELD_MAP = {
         'PM25': 'PM25',
         'PM25raw': 'PM25raw',
@@ -119,10 +117,9 @@ data:
         'noisedba': 'Noise',
     }
 
-    # Definimos las métricas que deben ser enteros para el formateo final
     METRICS_AS_INTEGER = {
-        'PM25', 'PM25raw', 'PM251', 'PM252', 'PM1', 'VOC', 'NOx', 'Humidity', 
-        'Temperature', 'RSSI', 'InOut', 'ConfigVal', 'Var1', 'Var2', 
+        'PM25', 'PM25raw', 'PM251', 'PM252', 'PM1', 'VOC', 'NOx', 'Humidity',
+        'Temperature', 'RSSI', 'InOut', 'ConfigVal', 'Var1', 'Var2',
         'NoisePeak', 'Noise'
     }
 
@@ -220,58 +217,53 @@ data:
                         if job in last_seen:
                             del last_seen[job]
 
-    # Nueva función para generar el texto de salida manualmente
+    # Custom renderer: generate Prometheus text and control integer presentation
     def generate_custom_metrics(registry):
-        """
-        Genera la salida de texto de Prometheus manualmente para controlar el formato de los números.
-        """
         output = []
-        # Usamos el generador del colector para obtener las métricas
         for metric in registry.collect():
             output.append('# HELP ' + metric.name + ' ' + metric.documentation)
             output.append('# TYPE ' + metric.name + ' ' + metric.type)
             for sample in metric.samples:
-                # Formatear las etiquetas - CORREGIDO: usar concatenación de strings
                 label_parts = []
                 for k, v in sorted(sample.labels.items()):
                     label_parts.append(k + '="' + str(v) + '"')
                 labels = '{' + ','.join(label_parts) + '}'
 
-                # Formatear el valor
                 value = sample.value
                 formatted_value = ""
                 try:
-                    # Si es una métrica de nuestra lista y es un número entero...
                     if sample.name in METRICS_AS_INTEGER and float(value) == int(float(value)):
-                        formatted_value = str(int(float(value))) # ...la formateamos como entero
+                        formatted_value = str(int(float(value)))
                     else:
-                        formatted_value = str(value) # ...si no, como viene
+                        formatted_value = str(value)
                 except (ValueError, TypeError):
-                    formatted_value = str(value) # Fallback
-
+                    formatted_value = str(value)
                 output.append(sample.name + labels + ' ' + formatted_value)
-        
         return '\n'.join(output).encode('utf-8')
 
-    # Modificar el servidor HTTP para usar nuestra función
+    # Serve both /metrics and /api/v1/metrics
     def start_metrics_http_server(port, registry):
-        """
-        Inicia un servidor WSGI que usa nuestra función de renderizado personalizado.
-        """
         def app(environ, start_response):
-            # Generar la salida con nuestro formateador personalizado
-            data = generate_custom_metrics(registry)
-            
-            status = '200 OK'
-            headers = [
-                ('Content-Type', 'text/plain; version=0.0.4; charset=utf-8'),
-                ('Content-Length', str(len(data)))
-            ]
-            start_response(status, headers)
-            return [data]
+            path = environ.get('PATH_INFO', '') or '/'
+            allowed = ('/metrics', '/metrics/', '/api/v1/metrics', '/api/v1/metrics/')
+            if path in allowed:
+                data = generate_custom_metrics(registry)
+                status = '200 OK'
+                headers = [
+                    ('Content-Type', 'text/plain; version=0.0.4; charset=utf-8'),
+                    ('Content-Length', str(len(data)))
+                ]
+                start_response(status, headers)
+                return [data]
+            # optional redirect from root to /api/v1/metrics (commented; enable if desired)
+            if path == '/':
+                start_response('302 Found', [('Location', '/api/v1/metrics')])
+                return [b'']
+            start_response('404 Not Found', [('Content-Type', 'text/plain')])
+            return [b'Not Found']
 
         httpd = make_server('', port, app)
-        print(f"Metrics HTTP server started on 0.0.0.0:{port}")
+        print(f"Metrics HTTP server started on 0.0.0.0:{port} (serving /metrics and /api/v1/metrics)")
         httpd.serve_forever()
 
     # ---------- Main ----------
