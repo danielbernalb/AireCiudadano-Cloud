@@ -1,0 +1,9 @@
+workers = 2  # Solo un proceso para evitar colapsar el servidor
+threads = 2  # Un solo hilo por worker para consumo controlado de RAM
+worker_class = 'sync'  # Evita problemas con cálculos largos y asincronía
+worker_connections = 10  # Evita acumulación de conexiones
+timeout = 5400  # 1.5 hora de espera (evita que las solicitudes se corten)
+keepalive = 60  # Mantiene conexiones activas sin reconexión constante
+max_requests = 50  # Previene fugas de memoria reiniciando workers
+max_requests_jitter = 10  # Evita que todos los workers se reinicien al mismo tiempo
+graceful_timeout = 30  # Tiempo de gracia para reiniciar workers
