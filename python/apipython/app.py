@@ -1,4 +1,6 @@
+# API para lectura de aqicn y otros https://api.aireciudadano.com/fixstations
 # app.py cambios por nuevo pushgateway que no devuelve JSON, 14 sept 2025
+
 import re
 import json
 from datetime import datetime

@@ -1,3 +1,5 @@
+# API para lectura de aqicn y otros https://api.aireciudadano.com/fixstations
+
 import json
 import requests
 from flask import Flask, jsonify, make_response

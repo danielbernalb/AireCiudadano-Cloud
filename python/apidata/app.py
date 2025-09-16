@@ -1,4 +1,4 @@
-# p1claudef: Parece todo bien, seguir probando. 4 meses van bien.
+# API AIRECIUDADANO v1.1
 
 from flask import Flask, request, jsonify, render_template_string, send_file, Response
 import threading  # Import the threading module
@@ -225,7 +225,7 @@ def index():
 
     return render_template_string('''
         <form action="/dataresult" method="post">
-            <h2>API AIRECIUDADANO v1.0</h2>
+            <h2>API AIRECIUDADANO v1.1</h2>
             <h3>Instructions at: <a href="https://aireciudadano.com/apidata/" target="_blank">aireciudadano.com/apidata</a></h3><br>
             <label for="variables">Select variables:</label><br>
             <br>
