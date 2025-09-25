@@ -61,11 +61,11 @@ spec:
             failureThreshold: 4
           resources:
             requests:
-            cpu: "200m"
-            memory: "250Mi"
+              cpu: "200m"
+              memory: "250Mi"
             limits:
-            cpu: "300m"
-            memory: "400Mi"
+              cpu: "300m"
+              memory: "400Mi"
       volumes:
         - name: config-volume
           configMap:
