@@ -60,7 +60,12 @@ spec:
             timeoutSeconds: 5
             failureThreshold: 4
           resources:
-            {{- toYaml .Values.resources.pushgatewaypython | nindent 12 }}
+            requests:
+            cpu: "200m"
+            memory: "250Mi"
+            limits:
+            cpu: "300m"
+            memory: "400Mi"
       volumes:
         - name: config-volume
           configMap:
