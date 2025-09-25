@@ -1,7 +1,13 @@
+# Combined manifest: Deployment + Service + ConfigMap for improved pushgateway python exporter
+# NOTE: change image to your built image (placeholder used below). If you don't have a registry image,
+# you can use `python:3.11-slim` as fallback (ConfigMap run.sh will install deps at startup).
+
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: pushgateway
+  namespace: default
   labels:
     app: pushgateway
 spec:
@@ -16,29 +22,56 @@ spec:
     spec:
       containers:
         - name: pushgateway
-          image: python
+          # Replace this image with your built image: registry.example.com/aireciudadano/pushgateway:stable-1
+          # Fallback: python:3.11-slim (works with the ConfigMap run.sh that installs deps)
+          image: python:3.11-slim
           command: ["/bin/bash", "-c", "/config/run.sh"]
-          volumeMounts:
-            - name: config-volume
-              mountPath: /config
           env:
             - name: MQTT_BROKER
               value: "mqtt-np"
             - name: MQTT_PORT
               value: "1883"
             - name: MQTT_TOPIC
-              value: "measurement"
+              value: "measurement,measurementinfsam"
             - name: EXPORTER_PORT
               value: "9091"
             - name: STALENESS_SECONDS
               value: "300"
             - name: CLEANUP_INTERVAL
               value: "60"
+            - name: LOG_PREFIX
+              value: "[pushgateway] "
+            - name: SUBSCRIBE_ALL
+              value: "false"
           ports:
             - containerPort: 9091
               name: http-metrics
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 9091
+            initialDelaySeconds: 20
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 9091
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 3
+            failureThreshold: 3
           resources:
-            {{- toYaml .Values.resources.pushgatewaypython | nindent 12 }}
+            requests:
+              cpu: "200m"
+              memory: "250Mi"
+            limits:
+              cpu: "300m"
+              memory: "400Mi"
+          volumeMounts:
+            - name: config-volume
+              mountPath: /config
       volumes:
         - name: config-volume
           configMap:
@@ -50,6 +83,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: pushgateway-np
+  namespace: default
 spec:
   type: NodePort
   selector:
@@ -61,30 +95,48 @@ spec:
       nodePort: 30991
 
 ---
-kind: ConfigMap
 apiVersion: v1
+kind: ConfigMap
 metadata:
   name: pushgateway
+  namespace: default
 data:
   run.sh: |
     #!/bin/bash
     set -euo pipefail
-    # instalar deps solo una vez al arranque (mejor: crear imagen con deps)
-    pip install -q paho-mqtt pyyaml prometheus_client
-    # -u para evitar buffering de stdout en contenedor
+    # Install deps with retries (if you use an image with deps preinstalled, this will be fast/no-op)
+    RETRIES=3
+    for i in $(seq 1 $RETRIES); do
+      pip install -q paho-mqtt pyyaml prometheus_client && break || {
+        echo "pip install attempt $i failed" >&2
+        sleep $((i*2))
+        if [ "$i" -eq "$RETRIES" ]; then
+          echo "pip install failed after $RETRIES attempts" >&2
+          exit 1
+        fi
+      }
+    done
+    # -u to avoid stdout buffering
     exec python -u /config/pushgatewaypython.py
 
   pushgatewaypython.py: |
+    #!/usr/bin/env python3
+    """
+    Pushgateway MQTT -> Prometheus exporter (mejorado)
+    - reconexión robusta (loop_start, reconnect_delay_set)
+    - métricas internas: mqtt_messages_total, mqtt_parse_errors_total, mqtt_connect_errors_total, mqtt_last_seen_unixtime
+    - /metrics and /api/v1/metrics (prometheus) + /healthz + /ready endpoints
+    - multi-topic support and SUBSCRIBE_ALL env var for debug
+    """
     import os
     import time
     import yaml
     import threading
+    import traceback
     from collections import defaultdict
-
-    from prometheus_client.core import GaugeMetricFamily, CollectorRegistry
-    from prometheus_client.exposition import make_wsgi_app
     from wsgiref.simple_server import make_server
 
+    from prometheus_client.core import GaugeMetricFamily, CollectorRegistry
     import paho.mqtt.client as mqtt
 
     # ---------- Config ----------
@@ -92,46 +144,43 @@ data:
     MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
     MQTT_TOPIC = os.environ.get("MQTT_TOPIC", "measurement")
     EXPORTER_PORT = int(os.environ.get("EXPORTER_PORT", "9091"))
-    STALENESS_SECONDS = int(os.environ.get("STALENESS_SECONDS", "300"))  # 5 min
+    STALENESS_SECONDS = int(os.environ.get("STALENESS_SECONDS", "300"))
     CLEANUP_INTERVAL = int(os.environ.get("CLEANUP_INTERVAL", "60"))
+    SUBSCRIBE_ALL = os.environ.get("SUBSCRIBE_ALL", "false").lower() in ("1", "true", "yes")
+    LOG_PREFIX = os.environ.get("LOG_PREFIX", "")
     # ---------------------------
 
+    def log(s):
+        ts = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime())
+        print(f"{ts} {LOG_PREFIX}{s}", flush=True)
+
     FIELD_MAP = {
-        'PM25': 'PM25',
-        'PM25raw': 'PM25raw',
-        'PM251': 'PM251',
-        'PM252': 'PM252',
-        'PM1': 'PM1',
-        'VOC': 'VOC',
-        'NOx': 'NOx',
-        'humidity': 'Humidity',
-        'temperature': 'Temperature',
-        'RSSI': 'RSSI',
-        'latitude': 'Latitude',
-        'longitude': 'Longitude',
-        'inout': 'InOut',
-        'configval': 'ConfigVal',
-        'datavar1': 'Var1',
-        'datavar2': 'Var2',
-        'noisepeak': 'NoisePeak',
-        'noisedba': 'Noise',
+        'PM25': 'PM25','PM25raw': 'PM25raw','PM251': 'PM251','PM252': 'PM252','PM1': 'PM1',
+        'VOC': 'VOC','NOx': 'NOx','humidity': 'Humidity','temperature': 'Temperature',
+        'RSSI': 'RSSI','latitude': 'Latitude','longitude': 'Longitude','inout': 'InOut',
+        'configval': 'ConfigVal','datavar1': 'Var1','datavar2': 'Var2','noisepeak': 'NoisePeak','noisedba': 'Noise',
     }
+    METRICS_AS_INTEGER = {'PM25','PM25raw','PM251','PM252','PM1','VOC','NOx','Humidity','Temperature','RSSI','InOut','ConfigVal','Var1','Var2','NoisePeak','Noise'}
 
-    METRICS_AS_INTEGER = {
-        'PM25', 'PM25raw', 'PM251', 'PM252', 'PM1', 'VOC', 'NOx', 'Humidity',
-        'Temperature', 'RSSI', 'InOut', 'ConfigVal', 'Var1', 'Var2',
-        'NoisePeak', 'Noise'
+    metrics_data = defaultdict(dict)   # metric_name -> {device_id: value}
+    metrics_lock = threading.RLock()
+    last_seen = {}                     # device_id -> last seen unixtime
+    last_seen_lock = threading.RLock()
+
+    internal_counters = {
+        'mqtt_messages_total': 0,
+        'mqtt_parsed_total': 0,
+        'mqtt_parse_errors_total': 0,
+        'mqtt_connect_errors_total': 0,
+        'mqtt_disconnects_total': 0,
     }
+    internal_lock = threading.RLock()
 
-    # metrics_data: metric_name -> dict(job -> numeric_value)
-    metrics_data = defaultdict(dict)
-    metrics_lock = threading.Lock()
+    if SUBSCRIBE_ALL:
+        MQTT_TOPICS = ['#']
+    else:
+        MQTT_TOPICS = [t.strip() for t in MQTT_TOPIC.split(',') if t.strip()]
 
-    # last_seen per job to implement cleanup (staleness)
-    last_seen = {}
-    last_seen_lock = threading.Lock()
-
-    # ---------- Helpers ----------
     def map_field_name(key):
         return FIELD_MAP.get(key, key)
 
@@ -140,12 +189,12 @@ data:
         if isinstance(val, (int, float)): return val
         if isinstance(val, str):
             try:
-                return float(val) if '.' in val or 'e' in val.lower() else int(val)
-            except (ValueError, TypeError):
+                return float(val) if ('.' in val or 'e' in val.lower()) else int(val)
+            except Exception:
                 return 0
         try:
             return float(val)
-        except (ValueError, TypeError):
+        except Exception:
             return 0
 
     def update_metrics_from_payload(device_id, payload):
@@ -159,15 +208,6 @@ data:
                 num = to_number_preserve_type(v)
                 metrics_data[metric_name][device_id] = num
 
-    def remove_job_from_metrics(job):
-        with metrics_lock:
-            for metric in list(metrics_data.keys()):
-                if job in metrics_data[metric]:
-                    del metrics_data[metric][job]
-                if not metrics_data[metric]:
-                    del metrics_data[metric]
-
-    # ---------- Collector ----------
     class OrderedMetricsCollector(object):
         def collect(self):
             with metrics_lock:
@@ -179,114 +219,187 @@ data:
                     value = job_values[job]
                     try:
                         g.add_metric(["", job], float(value))
-                    except (ValueError, TypeError):
+                    except Exception:
                         g.add_metric(["", job], 0.0)
                 yield g
 
-    # ---------- MQTT handling ----------
+            with internal_lock:
+                counters_copy = dict(internal_counters)
+
+            g_msgs = GaugeMetricFamily('mqtt_messages_total', 'Total MQTT messages received (counter-like)', labels=[])
+            g_msgs.add_metric([], float(counters_copy.get('mqtt_messages_total', 0)))
+            yield g_msgs
+
+            g_parsed = GaugeMetricFamily('mqtt_parsed_total', 'Total MQTT messages parsed successfully', labels=[])
+            g_parsed.add_metric([], float(counters_copy.get('mqtt_parsed_total', 0)))
+            yield g_parsed
+
+            g_parse_err = GaugeMetricFamily('mqtt_parse_errors_total', 'Total MQTT parse errors', labels=[])
+            g_parse_err.add_metric([], float(counters_copy.get('mqtt_parse_errors_total', 0)))
+            yield g_parse_err
+
+            g_conn_err = GaugeMetricFamily('mqtt_connect_errors_total', 'MQTT connection errors', labels=[])
+            g_conn_err.add_metric([], float(counters_copy.get('mqtt_connect_errors_total', 0)))
+            yield g_conn_err
+
+            with last_seen_lock:
+                last_seen_copy = dict(last_seen)
+            if last_seen_copy:
+                g_last = GaugeMetricFamily('mqtt_last_seen_unixtime', 'Unix time of last message per device', labels=['job'])
+                for job, ts in last_seen_copy.items():
+                    g_last.add_metric([job], float(ts))
+                yield g_last
+
     def on_connect(client, userdata, flags, rc, properties=None):
-        print("Connected to MQTT broker; subscribing to", MQTT_TOPIC)
-        client.subscribe([(MQTT_TOPIC, 0)])
+        log(f"[mqtt] on_connect rc={rc} flags={flags}; subscribing to {MQTT_TOPICS}")
+        try:
+            subs = [(t, 0) for t in MQTT_TOPICS]
+            client.subscribe(subs)
+        except Exception as e:
+            log(f"[mqtt] subscribe failed: {e}")
+
+    def on_disconnect(client, userdata, rc):
+        with internal_lock:
+            internal_counters['mqtt_disconnects_total'] += 1
+        log(f"[mqtt] on_disconnect rc={rc}")
 
     def on_message(client, userdata, msg):
+        with internal_lock:
+            internal_counters['mqtt_messages_total'] += 1
         try:
-            raw = msg.payload.decode('utf-8')
+            raw = msg.payload.decode('utf-8', errors='replace')
             payload = yaml.safe_load(raw)
-            if not isinstance(payload, dict): return
+            if not isinstance(payload, dict):
+                with internal_lock:
+                    internal_counters['mqtt_parse_errors_total'] += 1
+                log(f"[mqtt] payload not dict; head: {raw[:200]}")
+                return
             device_id = payload.get('id') or payload.get('ID') or payload.get('device')
-            if not device_id: return
+            if not device_id:
+                with internal_lock:
+                    internal_counters['mqtt_parse_errors_total'] += 1
+                log(f"[mqtt] message without id; head: {raw[:200]}")
+                return
             update_metrics_from_payload(device_id, payload)
-        except Exception as e:
-            print("Error processing message:", e)
+            with internal_lock:
+                internal_counters['mqtt_parsed_total'] += 1
+        except Exception:
+            with internal_lock:
+                internal_counters['mqtt_parse_errors_total'] += 1
+            log(f"[mqtt] Error processing message: {traceback.format_exc()}")
 
-    # ---------- Cleanup thread ----------
     def cleanup_loop():
         while True:
-            time.sleep(CLEANUP_INTERVAL)
-            now = time.time()
-            to_remove = []
-            with last_seen_lock:
-                for job, ts in list(last_seen.items()):
-                    if (now - ts) > STALENESS_SECONDS:
-                        to_remove.append(job)
-            if to_remove:
-                for job in to_remove:
-                    print(f"Removing stale job: {job}")
-                    remove_job_from_metrics(job)
-                    with last_seen_lock:
-                        if job in last_seen:
-                            del last_seen[job]
+            try:
+                time.sleep(CLEANUP_INTERVAL)
+                now = time.time()
+                to_remove = []
+                with last_seen_lock:
+                    for job, ts in list(last_seen.items()):
+                        if (now - ts) > STALENESS_SECONDS:
+                            to_remove.append(job)
+                if to_remove:
+                    for job in to_remove:
+                        log(f"Removing stale job: {job}")
+                        with metrics_lock:
+                            for metric in list(metrics_data.keys()):
+                                if job in metrics_data[metric]:
+                                    del metrics_data[metric][job]
+                                if not metrics_data[metric]:
+                                    del metrics_data[metric]
+                        with last_seen_lock:
+                            if job in last_seen:
+                                del last_seen[job]
+            except Exception:
+                log("[cleanup] Exception: " + traceback.format_exc())
 
-    # Custom renderer: generate Prometheus text and control integer presentation
-    def generate_custom_metrics(registry):
-        output = []
-        for metric in registry.collect():
-            output.append('# HELP ' + metric.name + ' ' + metric.documentation)
-            output.append('# TYPE ' + metric.name + ' ' + metric.type)
-            for sample in metric.samples:
-                label_parts = []
-                for k, v in sorted(sample.labels.items()):
-                    label_parts.append(k + '="' + str(v) + '"')
-                labels = '{' + ','.join(label_parts) + '}'
-
-                value = sample.value
-                formatted_value = ""
-                try:
-                    if sample.name in METRICS_AS_INTEGER and float(value) == int(float(value)):
-                        formatted_value = str(int(float(value)))
-                    else:
-                        formatted_value = str(value)
-                except (ValueError, TypeError):
-                    formatted_value = str(value)
-                output.append(sample.name + labels + ' ' + formatted_value)
-        return '\n'.join(output).encode('utf-8')
-
-    # Serve both /metrics and /api/v1/metrics
-    def start_metrics_http_server(port, registry):
+    def start_http_server(port, registry):
         def app(environ, start_response):
             path = environ.get('PATH_INFO', '') or '/'
             allowed = ('/metrics', '/metrics/', '/api/v1/metrics', '/api/v1/metrics/')
             if path in allowed:
-                data = generate_custom_metrics(registry)
-                status = '200 OK'
-                headers = [
-                    ('Content-Type', 'text/plain; version=0.0.4; charset=utf-8'),
-                    ('Content-Length', str(len(data)))
-                ]
-                start_response(status, headers)
+                lines = []
+                for metric in registry.collect():
+                    lines.append('# HELP ' + metric.name + ' ' + metric.documentation)
+                    lines.append('# TYPE ' + metric.name + ' ' + metric.type)
+                    for sample in metric.samples:
+                        label_parts = []
+                        for k, v in sorted(sample.labels.items()):
+                            label_parts.append(f'{k}="{v}"')
+                        labels = '{' + ','.join(label_parts) + '}' if label_parts else ''
+                        value = sample.value
+                        lines.append(f"{sample.name}{labels} {value}")
+                data = '\n'.join(lines).encode('utf-8')
+                start_response('200 OK', [('Content-Type', 'text/plain; version=0.0.4; charset=utf-8'), ('Content-Length', str(len(data)) )])
                 return [data]
-            # optional redirect from root to /api/v1/metrics (commented; enable if desired)
-            if path == '/':
-                start_response('302 Found', [('Location', '/api/v1/metrics')])
-                return [b'']
-            start_response('404 Not Found', [('Content-Type', 'text/plain')])
+            if path == '/healthz':
+                ok = False
+                with last_seen_lock:
+                    if last_seen:
+                        if max(last_seen.values()) >= time.time() - (STALENESS_SECONDS * 2):
+                            ok = True
+                status = '200 OK' if ok else '500 Internal Server Error'
+                body = b'OK' if ok else b'NOT OK'
+                start_response(status, [('Content-Type','text/plain')])
+                return [body]
+            if path == '/ready':
+                ready = False
+                with last_seen_lock:
+                    if last_seen:
+                        ready = True
+                start_response('200 OK' if ready else '503 Service Unavailable', [('Content-Type','text/plain')])
+                return [b'READY' if ready else b'NOT READY']
+            start_response('404 Not Found', [('Content-Type','text/plain')])
             return [b'Not Found']
 
         httpd = make_server('', port, app)
-        print(f"Metrics HTTP server started on 0.0.0.0:{port} (serving /metrics and /api/v1/metrics)")
+        log(f"[http] started on 0.0.0.0:{port} (metrics + healthz + ready)")
         httpd.serve_forever()
 
-    # ---------- Main ----------
     def main():
         registry = CollectorRegistry()
         registry.register(OrderedMetricsCollector())
 
-        http_thread = threading.Thread(target=start_metrics_http_server, args=(EXPORTER_PORT, registry), daemon=True)
-        http_thread.start()
-
-        t = threading.Thread(target=cleanup_loop, daemon=True)
-        t.start()
+        threading.Thread(target=start_http_server, args=(EXPORTER_PORT, registry), daemon=True).start()
+        threading.Thread(target=cleanup_loop, daemon=True).start()
 
         client = mqtt.Client()
         client.on_connect = on_connect
         client.on_message = on_message
+        client.on_disconnect = on_disconnect
+        client.reconnect_delay_set(min_delay=1, max_delay=60)
+
+        for attempt in range(1, 11):
+            try:
+                log(f"[mqtt] connecting to {MQTT_BROKER}:{MQTT_PORT} (attempt {attempt})")
+                client.connect(MQTT_BROKER, MQTT_PORT, 60)
+                break
+            except Exception as e:
+                with internal_lock:
+                    internal_counters['mqtt_connect_errors_total'] += 1
+                log(f"[mqtt] connect attempt {attempt} failed: {e}")
+                time.sleep(min(5 * attempt, 30))
+        else:
+            log("[mqtt] failed to connect after retries, exiting")
+            raise SystemExit(1)
+
+        client.loop_start()
+        log(f"[main] Listening to MQTT broker {MQTT_BROKER}:{MQTT_PORT} topics {MQTT_TOPICS} and exposing metrics on :{EXPORTER_PORT}")
+
         try:
-            client.connect(MQTT_BROKER, MQTT_PORT, 60)
-        except Exception as e:
-            print("Error connecting to MQTT broker:", e)
-            raise
-        print(f"Listening to MQTT broker {MQTT_BROKER}:{MQTT_PORT} topic '{MQTT_TOPIC}' and exposing metrics on :{EXPORTER_PORT}")
-        client.loop_forever()
+            while True:
+                time.sleep(60)
+        except KeyboardInterrupt:
+            log("KeyboardInterrupt - shutting down")
+        except Exception:
+            log("Exception in main loop: " + traceback.format_exc())
+        finally:
+            client.loop_stop()
+            try:
+                client.disconnect()
+            except Exception:
+                pass
+            log("Exiting")
 
     if __name__ == '__main__':
         main()
