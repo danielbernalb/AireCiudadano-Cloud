@@ -16,7 +16,8 @@ spec:
     spec:
       containers:
         - name: pushgateway
-          image: python
+          image: python:3.11-slim
+          # mejor: construir una imagen propia con las dependencias instaladas
           command: ["/bin/bash", "-c", "/config/run.sh"]
           volumeMounts:
             - name: config-volume
@@ -34,9 +35,30 @@ spec:
               value: "300"
             - name: CLEANUP_INTERVAL
               value: "60"
+            - name: MQTT_KEEPALIVE
+              value: "60"
+            - name: MQTT_DISCONNECT_RESTART_SECONDS
+              value: "180"
           ports:
             - containerPort: 9091
               name: http-metrics
+          # probes que harán que Kubernetes reinicie el pod si algo falla
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: http-metrics
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http-metrics
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 4
           resources:
             {{- toYaml .Values.resources.pushgatewaypython | nindent 12 }}
       volumes:
@@ -69,9 +91,9 @@ data:
   run.sh: |
     #!/bin/bash
     set -euo pipefail
-    # instalar deps solo una vez al arranque (mejor: crear imagen con deps)
-    pip install -q paho-mqtt pyyaml prometheus_client
-    # -u para evitar buffering de stdout en contenedor
+    # Ideal: crear una imagen docker con las dependencias ya instaladas.
+    # Si no tienes imagen, instala deps al arranque (es menos óptimo)
+    pip install --no-cache-dir -q paho-mqtt pyyaml prometheus_client
     exec python -u /config/pushgatewaypython.py
 
   pushgatewaypython.py: |
@@ -79,12 +101,13 @@ data:
     import time
     import yaml
     import threading
+    import logging
+    import signal
+    import sys
+
     from collections import defaultdict
-
     from prometheus_client.core import GaugeMetricFamily, CollectorRegistry
-    from prometheus_client.exposition import make_wsgi_app
     from wsgiref.simple_server import make_server
-
     import paho.mqtt.client as mqtt
 
     # ---------- Config ----------
@@ -94,7 +117,17 @@ data:
     EXPORTER_PORT = int(os.environ.get("EXPORTER_PORT", "9091"))
     STALENESS_SECONDS = int(os.environ.get("STALENESS_SECONDS", "300"))  # 5 min
     CLEANUP_INTERVAL = int(os.environ.get("CLEANUP_INTERVAL", "60"))
+    MQTT_KEEPALIVE = int(os.environ.get("MQTT_KEEPALIVE", "60"))
+    MQTT_DISCONNECT_RESTART_SECONDS = int(os.environ.get("MQTT_DISCONNECT_RESTART_SECONDS", "120"))
     # ---------------------------
+
+    # Logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        stream=sys.stdout
+    )
+    log = logging.getLogger("pushgateway")
 
     FIELD_MAP = {
         'PM25': 'PM25',
@@ -123,15 +156,20 @@ data:
         'NoisePeak', 'Noise'
     }
 
-    # metrics_data: metric_name -> dict(job -> numeric_value)
     metrics_data = defaultdict(dict)
     metrics_lock = threading.Lock()
-
-    # last_seen per job to implement cleanup (staleness)
     last_seen = {}
     last_seen_lock = threading.Lock()
 
-    # ---------- Helpers ----------
+    # global internal counters
+    internal_stats = {
+        'messages_total': 0,
+        'messages_errors': 0,
+    }
+
+    stop_event = threading.Event()
+    mqtt_client = None
+
     def map_field_name(key):
         return FIELD_MAP.get(key, key)
 
@@ -167,9 +205,16 @@ data:
                 if not metrics_data[metric]:
                     del metrics_data[metric]
 
-    # ---------- Collector ----------
     class OrderedMetricsCollector(object):
         def collect(self):
+            # expose internal counters
+            mt = GaugeMetricFamily('pushgateway_messages_total', 'Total MQTT messages received (pushgateway)')
+            mt.add_metric([], float(internal_stats['messages_total']))
+            yield mt
+            me = GaugeMetricFamily('pushgateway_messages_errors_total', 'Total processing errors')
+            me.add_metric([], float(internal_stats['messages_errors']))
+            yield me
+
             with metrics_lock:
                 metric_items = {k: dict(v) for k, v in metrics_data.items()}
             for metric_name in sorted(metric_items.keys(), key=lambda s: s.lower()):
@@ -183,52 +228,63 @@ data:
                         g.add_metric(["", job], 0.0)
                 yield g
 
-    # ---------- MQTT handling ----------
     def on_connect(client, userdata, flags, rc, properties=None):
-        print("Connected to MQTT broker; subscribing to", MQTT_TOPIC)
-        client.subscribe([(MQTT_TOPIC, 0)])
+        if rc == 0:
+            log.info("Connected to MQTT broker; subscribing to %s", MQTT_TOPIC)
+            client.subscribe([(MQTT_TOPIC, 0)])
+        else:
+            log.warning("MQTT on_connect returned rc=%s", rc)
 
     def on_message(client, userdata, msg):
         try:
             raw = msg.payload.decode('utf-8')
             payload = yaml.safe_load(raw)
-            if not isinstance(payload, dict): return
+            if not isinstance(payload, dict):
+                return
             device_id = payload.get('id') or payload.get('ID') or payload.get('device')
-            if not device_id: return
+            if not device_id:
+                log.debug("Message without device id: %s", raw[:200])
+                return
             update_metrics_from_payload(device_id, payload)
+            internal_stats['messages_total'] += 1
         except Exception as e:
-            print("Error processing message:", e)
+            internal_stats['messages_errors'] += 1
+            log.exception("Error processing message: %s", e)
 
-    # ---------- Cleanup thread ----------
+    def on_disconnect(client, userdata, rc):
+        log.warning("MQTT disconnected with rc=%s", rc)
+
     def cleanup_loop():
-        while True:
+        while not stop_event.is_set():
             time.sleep(CLEANUP_INTERVAL)
-            now = time.time()
-            to_remove = []
-            with last_seen_lock:
-                for job, ts in list(last_seen.items()):
-                    if (now - ts) > STALENESS_SECONDS:
-                        to_remove.append(job)
-            if to_remove:
-                for job in to_remove:
-                    print(f"Removing stale job: {job}")
-                    remove_job_from_metrics(job)
-                    with last_seen_lock:
-                        if job in last_seen:
-                            del last_seen[job]
+            try:
+                now = time.time()
+                to_remove = []
+                with last_seen_lock:
+                    for job, ts in list(last_seen.items()):
+                        if (now - ts) > STALENESS_SECONDS:
+                            to_remove.append(job)
+                if to_remove:
+                    for job in to_remove:
+                        log.info("Removing stale job: %s", job)
+                        remove_job_from_metrics(job)
+                        with last_seen_lock:
+                            if job in last_seen:
+                                del last_seen[job]
+            except Exception:
+                log.exception("Error in cleanup loop")
 
-    # Custom renderer: generate Prometheus text and control integer presentation
     def generate_custom_metrics(registry):
         output = []
         for metric in registry.collect():
-            output.append('# HELP ' + metric.name + ' ' + metric.documentation)
-            output.append('# TYPE ' + metric.name + ' ' + metric.type)
+            output.append('# HELP ' + metric.name + ' ' + getattr(metric, 'documentation', ''))
+            metric_type = getattr(metric, 'type', 'gauge')
+            output.append('# TYPE ' + metric.name + ' ' + metric_type)
             for sample in metric.samples:
                 label_parts = []
                 for k, v in sorted(sample.labels.items()):
                     label_parts.append(k + '="' + str(v) + '"')
-                labels = '{' + ','.join(label_parts) + '}'
-
+                labels = '{' + ','.join(label_parts) + '}' if label_parts else ''
                 value = sample.value
                 formatted_value = ""
                 try:
@@ -241,7 +297,6 @@ data:
                 output.append(sample.name + labels + ' ' + formatted_value)
         return '\n'.join(output).encode('utf-8')
 
-    # Serve both /metrics and /api/v1/metrics
     def start_metrics_http_server(port, registry):
         def app(environ, start_response):
             path = environ.get('PATH_INFO', '') or '/'
@@ -255,7 +310,27 @@ data:
                 ]
                 start_response(status, headers)
                 return [data]
-            # optional redirect from root to /api/v1/metrics (commented; enable if desired)
+            if path == '/healthz':
+                # health: OK if mqtt client connected OR we have recent last_seen
+                ok = False
+                try:
+                    if mqtt_client is not None and mqtt_client.is_connected():
+                        ok = True
+                    else:
+                        with last_seen_lock:
+                            if last_seen:
+                                # at least one device seen recently
+                                most_recent = max(last_seen.values())
+                                if time.time() - most_recent < max(60, STALENESS_SECONDS):
+                                    ok = True
+                except Exception:
+                    ok = False
+                if ok:
+                    start_response('200 OK', [('Content-Type', 'text/plain')])
+                    return [b'OK']
+                else:
+                    start_response('503 Service Unavailable', [('Content-Type', 'text/plain')])
+                    return [b'UNHEALTHY']
             if path == '/':
                 start_response('302 Found', [('Location', '/api/v1/metrics')])
                 return [b'']
@@ -263,30 +338,94 @@ data:
             return [b'Not Found']
 
         httpd = make_server('', port, app)
-        print(f"Metrics HTTP server started on 0.0.0.0:{port} (serving /metrics and /api/v1/metrics)")
+        log.info("Metrics HTTP server started on 0.0.0.0:%s (serving /metrics, /api/v1/metrics and /healthz)", port)
         httpd.serve_forever()
 
-    # ---------- Main ----------
+    def signal_handler(signum, frame):
+        log.info("Signal %s received, shutting down...", signum)
+        stop_event.set()
+        try:
+            if mqtt_client:
+                mqtt_client.disconnect()
+        except Exception:
+            pass
+        # allow threads to stop; then exit
+        time.sleep(1)
+        sys.exit(0)
+
+    def mqtt_watchdog_loop():
+        # si el cliente lleva desconectado mas de MQTT_DISCONNECT_RESTART_SECONDS, salimos (k8s reiniciará)
+        while not stop_event.is_set():
+            time.sleep(5)
+            try:
+                if mqtt_client is None:
+                    continue
+                if not mqtt_client.is_connected():
+                    # check last successful message time
+                    with last_seen_lock:
+                        if not last_seen:
+                            disconnected_duration = None
+                        else:
+                            most_recent = max(last_seen.values())
+                            disconnected_duration = time.time() - most_recent
+                    # Si nunca hemos recibido nada y el cliente no está conectado -> posible fallo
+                    if disconnected_duration is None:
+                        # si el cliente no está conectado y no hay mensajes en un tiempo razonable, reiniciamos
+                        # aquí sólo hacemos exit para forzar un restart por Kubernetes
+                        log.warning("MQTT client not connected and no messages seen yet. Forcing restart by exiting.")
+                        sys.exit(1)
+                    else:
+                        if disconnected_duration > MQTT_DISCONNECT_RESTART_SECONDS:
+                            log.warning("No messages received for %s seconds (> %s). Forcing restart.", int(disconnected_duration), MQTT_DISCONNECT_RESTART_SECONDS)
+                            sys.exit(1)
+            except Exception:
+                log.exception("Error in mqtt_watchdog_loop")
+
     def main():
+        global mqtt_client
         registry = CollectorRegistry()
         registry.register(OrderedMetricsCollector())
 
         http_thread = threading.Thread(target=start_metrics_http_server, args=(EXPORTER_PORT, registry), daemon=True)
         http_thread.start()
 
-        t = threading.Thread(target=cleanup_loop, daemon=True)
-        t.start()
+        t_cleanup = threading.Thread(target=cleanup_loop, daemon=True)
+        t_cleanup.start()
+
+        t_watchdog = threading.Thread(target=mqtt_watchdog_loop, daemon=True)
+        t_watchdog.start()
 
         client = mqtt.Client()
+        mqtt_client = client
         client.on_connect = on_connect
         client.on_message = on_message
+        client.on_disconnect = on_disconnect
+
+        # Graceful shutdown handlers
+        signal.signal(signal.SIGTERM, signal_handler)
+        signal.signal(signal.SIGINT, signal_handler)
+
         try:
-            client.connect(MQTT_BROKER, MQTT_PORT, 60)
+            client.connect(MQTT_BROKER, MQTT_PORT, MQTT_KEEPALIVE)
         except Exception as e:
-            print("Error connecting to MQTT broker:", e)
+            log.exception("Error connecting to MQTT broker: %s", e)
             raise
-        print(f"Listening to MQTT broker {MQTT_BROKER}:{MQTT_PORT} topic '{MQTT_TOPIC}' and exposing metrics on :{EXPORTER_PORT}")
-        client.loop_forever()
+
+        log.info("Listening to MQTT broker %s:%s topic '%s' and exposing metrics on :%s", MQTT_BROKER, MQTT_PORT, MQTT_TOPIC, EXPORTER_PORT)
+        # use loop_start so the main thread can run watchdog/cleanup and respond to signals
+        client.loop_start()
+
+        # block main thread until stop_event set
+        try:
+            while not stop_event.is_set():
+                time.sleep(1)
+        finally:
+            log.info("Main exiting, stopping mqtt loop")
+            try:
+                client.loop_stop()
+                client.disconnect()
+            except Exception:
+                pass
 
     if __name__ == '__main__':
         main()
