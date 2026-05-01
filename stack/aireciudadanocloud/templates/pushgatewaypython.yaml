@@ -17,11 +17,13 @@ spec:
       containers:
         - name: pushgateway
           image: python:3.11-slim
-          # mejor: construir una imagen propia con las dependencias instaladas
           command: ["/bin/bash", "-c", "/config/run.sh"]
           volumeMounts:
             - name: config-volume
               mountPath: /config
+            # NUEVO MONTAJE
+            - name: calibration-volume
+              mountPath: /etc/sensor-calibrations
           env:
             - name: MQTT_BROKER
               value: "mqtt-np"
@@ -39,6 +41,9 @@ spec:
               value: "60"
             - name: MQTT_DISCONNECT_RESTART_SECONDS
               value: "180"
+            # NUEVA VARIABLE PARA LA RUTA DE LA TABLA
+            - name: CALIBRATION_FILE_PATH
+              value: "/etc/sensor-calibrations/calibration.yaml"
           ports:
             - containerPort: 9091
               name: http-metrics
@@ -66,6 +71,10 @@ spec:
           configMap:
             name: pushgateway
             defaultMode: 0755
+        # NUEVO VOLUMEN
+        - name: calibration-volume
+          configMap:
+            name: calibration-config
 
 ---
 apiVersion: v1
@@ -83,6 +92,25 @@ spec:
       nodePort: 30991
 
 ---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: calibration-config
+data:
+  calibration.yaml: |
+    # Tabla de calibración para sensores CHS
+    # Formato: 
+    # ID_SENSOR:
+    #   a: valor_pendiente
+    #   b: valor_interseccion
+    CHS_21_P2_66rt34:
+      a: 0.98
+      b: -1.5
+    CHS_EJEMPLO_02:
+      a: 1.10
+      b: 2.0
+
+---
 kind: ConfigMap
 apiVersion: v1
 metadata:
@@ -91,8 +119,6 @@ data:
   run.sh: |
     #!/bin/bash
     set -euo pipefail
-    # Ideal: crear una imagen docker con las dependencias ya instaladas.
-    # Si no tienes imagen, instala deps al arranque (es menos óptimo)
     pip install --no-cache-dir -q paho-mqtt pyyaml prometheus_client
     exec python -u /config/pushgatewaypython.py
 
@@ -100,6 +126,7 @@ data:
     import os
     import time
     import yaml
+    import json # <-- Añadido para mejor rendimiento
     import threading
     import logging
     import signal
@@ -115,13 +142,13 @@ data:
     MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
     MQTT_TOPIC = os.environ.get("MQTT_TOPIC", "measurement")
     EXPORTER_PORT = int(os.environ.get("EXPORTER_PORT", "9091"))
-    STALENESS_SECONDS = int(os.environ.get("STALENESS_SECONDS", "300"))  # 5 min
+    STALENESS_SECONDS = int(os.environ.get("STALENESS_SECONDS", "300"))
     CLEANUP_INTERVAL = int(os.environ.get("CLEANUP_INTERVAL", "60"))
     MQTT_KEEPALIVE = int(os.environ.get("MQTT_KEEPALIVE", "60"))
     MQTT_DISCONNECT_RESTART_SECONDS = int(os.environ.get("MQTT_DISCONNECT_RESTART_SECONDS", "120"))
+    CALIBRATION_FILE = os.environ.get("CALIBRATION_FILE_PATH", "/etc/sensor-calibrations/calibration.yaml")
     # ---------------------------
 
-    # Logging
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
@@ -129,31 +156,34 @@ data:
     )
     log = logging.getLogger("pushgateway")
 
+    # Diccionario global para la tabla de calibración
+    chs_calibration_table = {}
+
+    def load_calibration_table():
+        """Carga o recarga el archivo YAML de calibración desde el ConfigMap"""
+        global chs_calibration_table
+        try:
+            if os.path.exists(CALIBRATION_FILE):
+                with open(CALIBRATION_FILE, 'r') as f:
+                    data = yaml.safe_load(f)
+                    if data:
+                        chs_calibration_table = data
+            else:
+                log.warning("Archivo de calibración no encontrado en %s", CALIBRATION_FILE)
+        except Exception as e:
+            log.error("Error recargando tabla de calibración: %s", e)
+
     FIELD_MAP = {
-        'PM25': 'PM25',
-        'PM25raw': 'PM25raw',
-        'PM251': 'PM251',
-        'PM252': 'PM252',
-        'PM1': 'PM1',
-        'VOC': 'VOC',
-        'NOx': 'NOx',
-        'humidity': 'Humidity',
-        'temperature': 'Temperature',
-        'RSSI': 'RSSI',
-        'latitude': 'Latitude',
-        'longitude': 'Longitude',
-        'inout': 'InOut',
-        'configval': 'ConfigVal',
-        'datavar1': 'Var1',
-        'datavar2': 'Var2',
-        'noisepeak': 'NoisePeak',
-        'noisedba': 'Noise',
+        'PM25': 'PM25', 'PM25raw': 'PM25raw', 'PM251': 'PM251', 'PM252': 'PM252',
+        'PM1': 'PM1', 'VOC': 'VOC', 'NOx': 'NOx', 'humidity': 'Humidity',
+        'temperature': 'Temperature', 'RSSI': 'RSSI', 'latitude': 'Latitude',
+        'longitude': 'Longitude', 'inout': 'InOut', 'configval': 'ConfigVal',
+        'datavar1': 'Var1', 'datavar2': 'Var2', 'noisepeak': 'NoisePeak', 'noisedba': 'Noise',
     }
 
     METRICS_AS_INTEGER = {
         'PM25', 'PM25raw', 'PM251', 'PM252', 'PM1', 'VOC', 'NOx', 'Humidity',
-        'Temperature', 'RSSI', 'InOut', 'ConfigVal', 'Var1', 'Var2',
-        'NoisePeak', 'Noise'
+        'Temperature', 'RSSI', 'InOut', 'ConfigVal', 'Var1', 'Var2', 'NoisePeak', 'Noise'
     }
 
     metrics_data = defaultdict(dict)
@@ -161,12 +191,7 @@ data:
     last_seen = {}
     last_seen_lock = threading.Lock()
 
-    # global internal counters
-    internal_stats = {
-        'messages_total': 0,
-        'messages_errors': 0,
-    }
-
+    internal_stats = {'messages_total': 0, 'messages_errors': 0}
     stop_event = threading.Event()
     mqtt_client = None
 
@@ -195,6 +220,19 @@ data:
                 if k == 'id': continue
                 metric_name = map_field_name(k)
                 num = to_number_preserve_type(v)
+
+                # LÓGICA DE CALIBRACIÓN EXTERNA
+                if metric_name == 'PM25' and device_id.startswith('CHS'):
+                    cal_data = chs_calibration_table.get(device_id, {})
+                    slope = cal_data.get('a', 1.0)
+                    intercept = cal_data.get('b', 0.0)
+                    
+                    try:
+                        corrected_val = (float(num) * slope) + intercept
+                        num = int(round(corrected_val))
+                    except Exception as e:
+                        log.error("Error calculando regresión para %s: %s", device_id, e)
+
                 metrics_data[metric_name][device_id] = num
 
     def remove_job_from_metrics(job):
@@ -207,7 +245,6 @@ data:
 
     class OrderedMetricsCollector(object):
         def collect(self):
-            # expose internal counters
             mt = GaugeMetricFamily('pushgateway_messages_total', 'Total MQTT messages received (pushgateway)')
             mt.add_metric([], float(internal_stats['messages_total']))
             yield mt
@@ -238,12 +275,16 @@ data:
     def on_message(client, userdata, msg):
         try:
             raw = msg.payload.decode('utf-8')
-            payload = yaml.safe_load(raw)
+            # Mejora 2: Intento primario con JSON (10x más rápido), fallback a YAML
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                payload = yaml.safe_load(raw)
+                
             if not isinstance(payload, dict):
                 return
             device_id = payload.get('id') or payload.get('ID') or payload.get('device')
             if not device_id:
-                log.debug("Message without device id: %s", raw[:200])
                 return
             update_metrics_from_payload(device_id, payload)
             internal_stats['messages_total'] += 1
@@ -257,6 +298,8 @@ data:
     def cleanup_loop():
         while not stop_event.is_set():
             time.sleep(CLEANUP_INTERVAL)
+            # Recarga automática de la tabla de calibración en cada ciclo
+            load_calibration_table()
             try:
                 now = time.time()
                 to_remove = []
@@ -311,7 +354,6 @@ data:
                 start_response(status, headers)
                 return [data]
             if path == '/healthz':
-                # health: OK if mqtt client connected OR we have recent last_seen
                 ok = False
                 try:
                     if mqtt_client is not None and mqtt_client.is_connected():
@@ -319,7 +361,6 @@ data:
                     else:
                         with last_seen_lock:
                             if last_seen:
-                                # at least one device seen recently
                                 most_recent = max(last_seen.values())
                                 if time.time() - most_recent < max(60, STALENESS_SECONDS):
                                     ok = True
@@ -338,7 +379,7 @@ data:
             return [b'Not Found']
 
         httpd = make_server('', port, app)
-        log.info("Metrics HTTP server started on 0.0.0.0:%s (serving /metrics, /api/v1/metrics and /healthz)", port)
+        log.info("Metrics HTTP server started on 0.0.0.0:%s", port)
         httpd.serve_forever()
 
     def signal_handler(signum, frame):
@@ -349,40 +390,40 @@ data:
                 mqtt_client.disconnect()
         except Exception:
             pass
-        # allow threads to stop; then exit
         time.sleep(1)
         sys.exit(0)
 
     def mqtt_watchdog_loop():
-        # si el cliente lleva desconectado mas de MQTT_DISCONNECT_RESTART_SECONDS, salimos (k8s reiniciará)
         while not stop_event.is_set():
             time.sleep(5)
             try:
                 if mqtt_client is None:
                     continue
                 if not mqtt_client.is_connected():
-                    # check last successful message time
                     with last_seen_lock:
                         if not last_seen:
                             disconnected_duration = None
                         else:
                             most_recent = max(last_seen.values())
                             disconnected_duration = time.time() - most_recent
-                    # Si nunca hemos recibido nada y el cliente no está conectado -> posible fallo
+                    
+                    # Mejora 1: Reemplazar sys.exit(1) con os._exit(1) para matar el proceso completo
                     if disconnected_duration is None:
-                        # si el cliente no está conectado y no hay mensajes en un tiempo razonable, reiniciamos
-                        # aquí sólo hacemos exit para forzar un restart por Kubernetes
-                        log.warning("MQTT client not connected and no messages seen yet. Forcing restart by exiting.")
-                        sys.exit(1)
+                        log.warning("MQTT client not connected and no messages seen yet. Forcing restart.")
+                        os._exit(1)
                     else:
                         if disconnected_duration > MQTT_DISCONNECT_RESTART_SECONDS:
-                            log.warning("No messages received for %s seconds (> %s). Forcing restart.", int(disconnected_duration), MQTT_DISCONNECT_RESTART_SECONDS)
-                            sys.exit(1)
+                            log.warning("No messages received for %s seconds. Forcing restart.", int(disconnected_duration))
+                            os._exit(1)
             except Exception:
                 log.exception("Error in mqtt_watchdog_loop")
 
     def main():
         global mqtt_client
+        
+        # Cargar tabla de calibración inicial
+        load_calibration_table()
+        
         registry = CollectorRegistry()
         registry.register(OrderedMetricsCollector())
 
@@ -401,7 +442,6 @@ data:
         client.on_message = on_message
         client.on_disconnect = on_disconnect
 
-        # Graceful shutdown handlers
         signal.signal(signal.SIGTERM, signal_handler)
         signal.signal(signal.SIGINT, signal_handler)
 
@@ -411,16 +451,14 @@ data:
             log.exception("Error connecting to MQTT broker: %s", e)
             raise
 
-        log.info("Listening to MQTT broker %s:%s topic '%s' and exposing metrics on :%s", MQTT_BROKER, MQTT_PORT, MQTT_TOPIC, EXPORTER_PORT)
-        # use loop_start so the main thread can run watchdog/cleanup and respond to signals
+        log.info("Listening to MQTT broker %s:%s topic '%s'", MQTT_BROKER, MQTT_PORT, MQTT_TOPIC)
         client.loop_start()
 
-        # block main thread until stop_event set
         try:
             while not stop_event.is_set():
                 time.sleep(1)
         finally:
-            log.info("Main exiting, stopping mqtt loop")
+            log.info("Main exiting")
             try:
                 client.loop_stop()
                 client.disconnect()
