@@ -21,7 +21,6 @@ spec:
           volumeMounts:
             - name: config-volume
               mountPath: /config
-            # NUEVO MONTAJE
             - name: calibration-volume
               mountPath: /etc/sensor-calibrations
           env:
@@ -41,13 +40,11 @@ spec:
               value: "60"
             - name: MQTT_DISCONNECT_RESTART_SECONDS
               value: "180"
-            # NUEVA VARIABLE PARA LA RUTA DE LA TABLA
             - name: CALIBRATION_FILE_PATH
               value: "/etc/sensor-calibrations/calibration.yaml"
           ports:
             - containerPort: 9091
               name: http-metrics
-          # probes que harán que Kubernetes reinicie el pod si algo falla
           readinessProbe:
             httpGet:
               path: /metrics
@@ -65,17 +62,15 @@ spec:
             timeoutSeconds: 5
             failureThreshold: 4
           resources:
-          {{- toYaml .Values.resources.pushgatewaypython | nindent 12 }}
+            {{- toYaml .Values.resources.pushgatewaypython | nindent 12 }}
       volumes:
         - name: config-volume
           configMap:
             name: pushgateway
             defaultMode: 0755
-        # NUEVO VOLUMEN
         - name: calibration-volume
           configMap:
-            name: calibration-config
-
+            name: calibration-config   # <-- referencia al ConfigMap separado
 ---
 apiVersion: v1
 kind: Service
@@ -90,26 +85,6 @@ spec:
       targetPort: http-metrics
       protocol: TCP
       nodePort: 30991
-
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: calibration-config
-data:
-  calibration.yaml: |
-    # Tabla de calibración para sensores CHS
-    # Formato: 
-    # ID_SENSOR:
-    #   a: valor_pendiente
-    #   b: valor_interseccion
-    CHS_21_P2_66rt34:
-      a: 0.98
-      b: -1.5
-    CHS_EJEMPLO_02:
-      a: 1.10
-      b: 2.0
-
 ---
 kind: ConfigMap
 apiVersion: v1
@@ -126,7 +101,7 @@ data:
     import os
     import time
     import yaml
-    import json # <-- Añadido para mejor rendimiento
+    import json
     import threading
     import logging
     import signal
@@ -138,13 +113,13 @@ data:
     import paho.mqtt.client as mqtt
 
     # ---------- Config ----------
-    MQTT_BROKER = os.environ.get("MQTT_BROKER", "localhost")
-    MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
-    MQTT_TOPIC = os.environ.get("MQTT_TOPIC", "measurement")
-    EXPORTER_PORT = int(os.environ.get("EXPORTER_PORT", "9091"))
-    STALENESS_SECONDS = int(os.environ.get("STALENESS_SECONDS", "300"))
-    CLEANUP_INTERVAL = int(os.environ.get("CLEANUP_INTERVAL", "60"))
-    MQTT_KEEPALIVE = int(os.environ.get("MQTT_KEEPALIVE", "60"))
+    MQTT_BROKER     = os.environ.get("MQTT_BROKER", "localhost")
+    MQTT_PORT       = int(os.environ.get("MQTT_PORT", "1883"))
+    MQTT_TOPIC      = os.environ.get("MQTT_TOPIC", "measurement")
+    EXPORTER_PORT   = int(os.environ.get("EXPORTER_PORT", "9091"))
+    STALENESS_SECONDS               = int(os.environ.get("STALENESS_SECONDS", "300"))
+    CLEANUP_INTERVAL                = int(os.environ.get("CLEANUP_INTERVAL", "60"))
+    MQTT_KEEPALIVE                  = int(os.environ.get("MQTT_KEEPALIVE", "60"))
     MQTT_DISCONNECT_RESTART_SECONDS = int(os.environ.get("MQTT_DISCONNECT_RESTART_SECONDS", "120"))
     CALIBRATION_FILE = os.environ.get("CALIBRATION_FILE_PATH", "/etc/sensor-calibrations/calibration.yaml")
     # ---------------------------
@@ -156,22 +131,23 @@ data:
     )
     log = logging.getLogger("pushgateway")
 
-    # Diccionario global para la tabla de calibración
     chs_calibration_table = {}
 
     def load_calibration_table():
-        """Carga o recarga el archivo YAML de calibración desde el ConfigMap"""
         global chs_calibration_table
         try:
             if os.path.exists(CALIBRATION_FILE):
                 with open(CALIBRATION_FILE, 'r') as f:
                     data = yaml.safe_load(f)
-                    if data:
+                    if isinstance(data, dict):
                         chs_calibration_table = data
+                        log.info("Tabla de calibración cargada: %d sensores", len(data))
+                    else:
+                        log.warning("calibration.yaml no contiene un diccionario válido")
             else:
                 log.warning("Archivo de calibración no encontrado en %s", CALIBRATION_FILE)
         except Exception as e:
-            log.error("Error recargando tabla de calibración: %s", e)
+            log.error("Error cargando tabla de calibración: %s", e)
 
     FIELD_MAP = {
         'PM25': 'PM25', 'PM25raw': 'PM25raw', 'PM251': 'PM251', 'PM252': 'PM252',
@@ -186,14 +162,14 @@ data:
         'Temperature', 'RSSI', 'InOut', 'ConfigVal', 'Var1', 'Var2', 'NoisePeak', 'Noise'
     }
 
-    metrics_data = defaultdict(dict)
-    metrics_lock = threading.Lock()
-    last_seen = {}
+    metrics_data   = defaultdict(dict)
+    metrics_lock   = threading.Lock()
+    last_seen      = {}
     last_seen_lock = threading.Lock()
 
     internal_stats = {'messages_total': 0, 'messages_errors': 0}
-    stop_event = threading.Event()
-    mqtt_client = None
+    stop_event     = threading.Event()
+    mqtt_client    = None
 
     def map_field_name(key):
         return FIELD_MAP.get(key, key)
@@ -217,21 +193,19 @@ data:
             last_seen[device_id] = now
         with metrics_lock:
             for k, v in payload.items():
-                if k == 'id': continue
+                if k == 'id':
+                    continue
                 metric_name = map_field_name(k)
                 num = to_number_preserve_type(v)
 
-                # LÓGICA DE CALIBRACIÓN EXTERNA
                 if metric_name == 'PM25' and device_id.startswith('CHS'):
-                    cal_data = chs_calibration_table.get(device_id, {})
-                    slope = cal_data.get('a', 1.0)
-                    intercept = cal_data.get('b', 0.0)
-                    
+                    cal = chs_calibration_table.get(device_id, {})
+                    a   = cal.get('a', 1.0)
+                    b   = cal.get('b', 0.0)
                     try:
-                        corrected_val = (float(num) * slope) + intercept
-                        num = int(round(corrected_val))
+                        num = int(round(float(num) * a + b))
                     except Exception as e:
-                        log.error("Error calculando regresión para %s: %s", device_id, e)
+                        log.error("Error en calibración PM25 para %s: %s", device_id, e)
 
                 metrics_data[metric_name][device_id] = num
 
@@ -245,22 +219,20 @@ data:
 
     class OrderedMetricsCollector(object):
         def collect(self):
-            mt = GaugeMetricFamily('pushgateway_messages_total', 'Total MQTT messages received (pushgateway)')
+            mt = GaugeMetricFamily('pushgateway_messages_total', 'Total MQTT messages received')
             mt.add_metric([], float(internal_stats['messages_total']))
             yield mt
             me = GaugeMetricFamily('pushgateway_messages_errors_total', 'Total processing errors')
             me.add_metric([], float(internal_stats['messages_errors']))
             yield me
-
             with metrics_lock:
                 metric_items = {k: dict(v) for k, v in metrics_data.items()}
             for metric_name in sorted(metric_items.keys(), key=lambda s: s.lower()):
                 job_values = metric_items[metric_name]
-                g = GaugeMetricFamily(metric_name, f'Auto-created metric {metric_name}', labels=['instance','job'])
+                g = GaugeMetricFamily(metric_name, f'Auto-created metric {metric_name}', labels=['instance', 'job'])
                 for job in sorted(job_values.keys(), key=lambda s: s.lower()):
-                    value = job_values[job]
                     try:
-                        g.add_metric(["", job], float(value))
+                        g.add_metric(["", job], float(job_values[job]))
                     except (ValueError, TypeError):
                         g.add_metric(["", job], 0.0)
                 yield g
@@ -275,12 +247,10 @@ data:
     def on_message(client, userdata, msg):
         try:
             raw = msg.payload.decode('utf-8')
-            # Mejora 2: Intento primario con JSON (10x más rápido), fallback a YAML
             try:
                 payload = json.loads(raw)
             except json.JSONDecodeError:
                 payload = yaml.safe_load(raw)
-                
             if not isinstance(payload, dict):
                 return
             device_id = payload.get('id') or payload.get('ID') or payload.get('device')
@@ -298,8 +268,7 @@ data:
     def cleanup_loop():
         while not stop_event.is_set():
             time.sleep(CLEANUP_INTERVAL)
-            # Recarga automática de la tabla de calibración en cada ciclo
-            load_calibration_table()
+            load_calibration_table()   # recarga automática periódica
             try:
                 now = time.time()
                 to_remove = []
@@ -307,13 +276,12 @@ data:
                     for job, ts in list(last_seen.items()):
                         if (now - ts) > STALENESS_SECONDS:
                             to_remove.append(job)
-                if to_remove:
-                    for job in to_remove:
-                        log.info("Removing stale job: %s", job)
-                        remove_job_from_metrics(job)
-                        with last_seen_lock:
-                            if job in last_seen:
-                                del last_seen[job]
+                for job in to_remove:
+                    log.info("Removing stale job: %s", job)
+                    remove_job_from_metrics(job)
+                    with last_seen_lock:
+                        if job in last_seen:
+                            del last_seen[job]
             except Exception:
                 log.exception("Error in cleanup loop")
 
@@ -321,20 +289,15 @@ data:
         output = []
         for metric in registry.collect():
             output.append('# HELP ' + metric.name + ' ' + getattr(metric, 'documentation', ''))
-            metric_type = getattr(metric, 'type', 'gauge')
-            output.append('# TYPE ' + metric.name + ' ' + metric_type)
+            output.append('# TYPE ' + metric.name + ' ' + getattr(metric, 'type', 'gauge'))
             for sample in metric.samples:
-                label_parts = []
-                for k, v in sorted(sample.labels.items()):
-                    label_parts.append(k + '="' + str(v) + '"')
+                label_parts = [k + '="' + str(v) + '"' for k, v in sorted(sample.labels.items())]
                 labels = '{' + ','.join(label_parts) + '}' if label_parts else ''
                 value = sample.value
-                formatted_value = ""
                 try:
-                    if sample.name in METRICS_AS_INTEGER and float(value) == int(float(value)):
-                        formatted_value = str(int(float(value)))
-                    else:
-                        formatted_value = str(value)
+                    formatted_value = (str(int(float(value)))
+                                       if sample.name in METRICS_AS_INTEGER and float(value) == int(float(value))
+                                       else str(value))
                 except (ValueError, TypeError):
                     formatted_value = str(value)
                 output.append(sample.name + labels + ' ' + formatted_value)
@@ -343,15 +306,12 @@ data:
     def start_metrics_http_server(port, registry):
         def app(environ, start_response):
             path = environ.get('PATH_INFO', '') or '/'
-            allowed = ('/metrics', '/metrics/', '/api/v1/metrics', '/api/v1/metrics/')
-            if path in allowed:
+            if path in ('/metrics', '/metrics/', '/api/v1/metrics', '/api/v1/metrics/'):
                 data = generate_custom_metrics(registry)
-                status = '200 OK'
-                headers = [
+                start_response('200 OK', [
                     ('Content-Type', 'text/plain; version=0.0.4; charset=utf-8'),
                     ('Content-Length', str(len(data)))
-                ]
-                start_response(status, headers)
+                ])
                 return [data]
             if path == '/healthz':
                 ok = False
@@ -361,17 +321,15 @@ data:
                     else:
                         with last_seen_lock:
                             if last_seen:
-                                most_recent = max(last_seen.values())
-                                if time.time() - most_recent < max(60, STALENESS_SECONDS):
+                                if time.time() - max(last_seen.values()) < max(60, STALENESS_SECONDS):
                                     ok = True
                 except Exception:
                     ok = False
                 if ok:
                     start_response('200 OK', [('Content-Type', 'text/plain')])
                     return [b'OK']
-                else:
-                    start_response('503 Service Unavailable', [('Content-Type', 'text/plain')])
-                    return [b'UNHEALTHY']
+                start_response('503 Service Unavailable', [('Content-Type', 'text/plain')])
+                return [b'UNHEALTHY']
             if path == '/':
                 start_response('302 Found', [('Location', '/api/v1/metrics')])
                 return [b'']
@@ -401,49 +359,38 @@ data:
                     continue
                 if not mqtt_client.is_connected():
                     with last_seen_lock:
-                        if not last_seen:
-                            disconnected_duration = None
-                        else:
-                            most_recent = max(last_seen.values())
-                            disconnected_duration = time.time() - most_recent
-                    
-                    # Mejora 1: Reemplazar sys.exit(1) con os._exit(1) para matar el proceso completo
+                        disconnected_duration = (
+                            None if not last_seen
+                            else time.time() - max(last_seen.values())
+                        )
                     if disconnected_duration is None:
-                        log.warning("MQTT client not connected and no messages seen yet. Forcing restart.")
+                        log.warning("MQTT not connected and no messages seen. Forcing restart.")
                         os._exit(1)
-                    else:
-                        if disconnected_duration > MQTT_DISCONNECT_RESTART_SECONDS:
-                            log.warning("No messages received for %s seconds. Forcing restart.", int(disconnected_duration))
-                            os._exit(1)
+                    elif disconnected_duration > MQTT_DISCONNECT_RESTART_SECONDS:
+                        log.warning("No messages for %ss. Forcing restart.", int(disconnected_duration))
+                        os._exit(1)
             except Exception:
                 log.exception("Error in mqtt_watchdog_loop")
 
     def main():
         global mqtt_client
-        
-        # Cargar tabla de calibración inicial
         load_calibration_table()
-        
+
         registry = CollectorRegistry()
         registry.register(OrderedMetricsCollector())
 
-        http_thread = threading.Thread(target=start_metrics_http_server, args=(EXPORTER_PORT, registry), daemon=True)
-        http_thread.start()
-
-        t_cleanup = threading.Thread(target=cleanup_loop, daemon=True)
-        t_cleanup.start()
-
-        t_watchdog = threading.Thread(target=mqtt_watchdog_loop, daemon=True)
-        t_watchdog.start()
+        threading.Thread(target=start_metrics_http_server, args=(EXPORTER_PORT, registry), daemon=True).start()
+        threading.Thread(target=cleanup_loop, daemon=True).start()
+        threading.Thread(target=mqtt_watchdog_loop, daemon=True).start()
 
         client = mqtt.Client()
         mqtt_client = client
-        client.on_connect = on_connect
-        client.on_message = on_message
+        client.on_connect    = on_connect
+        client.on_message    = on_message
         client.on_disconnect = on_disconnect
 
         signal.signal(signal.SIGTERM, signal_handler)
-        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGINT,  signal_handler)
 
         try:
             client.connect(MQTT_BROKER, MQTT_PORT, MQTT_KEEPALIVE)
@@ -451,7 +398,8 @@ data:
             log.exception("Error connecting to MQTT broker: %s", e)
             raise
 
-        log.info("Listening to MQTT broker %s:%s topic '%s'", MQTT_BROKER, MQTT_PORT, MQTT_TOPIC)
+        log.info("Listening on %s:%s topic '%s', metrics on :%s",
+                 MQTT_BROKER, MQTT_PORT, MQTT_TOPIC, EXPORTER_PORT)
         client.loop_start()
 
         try:
