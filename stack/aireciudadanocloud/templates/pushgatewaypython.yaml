@@ -191,23 +191,31 @@ data:
         now = time.time()
         with last_seen_lock:
             last_seen[device_id] = now
+            
         with metrics_lock:
+            # 1. Guardamos todos los valores originales tal como vienen en el JSON/YAML
             for k, v in payload.items():
-                if k == 'id':
-                    continue
+                if k == 'id': continue
                 metric_name = map_field_name(k)
                 num = to_number_preserve_type(v)
-
-                if metric_name == 'PM25' and device_id.startswith('CHS'):
-                    cal = chs_calibration_table.get(device_id, {})
-                    a   = cal.get('a', 1.0)
-                    b   = cal.get('b', 0.0)
-                    try:
-                        num = int(round(float(num) * a + b))
-                    except Exception as e:
-                        log.error("Error en calibración PM25 para %s: %s", device_id, e)
-
                 metrics_data[metric_name][device_id] = num
+
+            # 2. LÓGICA DE CALIBRACIÓN: Usar PM25raw para generar/sobrescribir PM25
+            if device_id.startswith('CHS'):
+                if 'PM25raw' in metrics_data and device_id in metrics_data['PM25raw']:
+                    raw_val = metrics_data['PM25raw'][device_id]
+                    cal_data = chs_calibration_table.get(device_id, {})
+                    slope     = cal_data.get('a', 1.0)
+                    intercept = cal_data.get('b', 0.0)
+                    try:
+                        corrected_val = (float(raw_val) * slope) + intercept
+                        metrics_data['PM25'][device_id] = int(round(corrected_val))
+                        log.debug("PM25 calibrado para %s: PM25raw=%.1f -> PM25=%d (slope=%.3f, intercept=%.3f)",
+                                device_id, raw_val, int(round(corrected_val)), slope, intercept)
+                    except Exception as e:
+                        log.error("Error calculando regresión para %s: %s", device_id, e)
+                else:
+                    log.warning("Sensor CHS '%s': sin PM25raw en datos, PM25 no calibrado.", device_id)
 
     def remove_job_from_metrics(job):
         with metrics_lock:
