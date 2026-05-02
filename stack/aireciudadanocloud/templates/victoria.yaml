@@ -1,0 +1,192 @@
+# victoriametrics-stack.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: victoriametrics-scrape
+data:
+  scrape.yml: |-
+    global:
+      scrape_interval: 60s
+      evaluation_interval: 180s
+
+    scrape_configs:
+      - job_name: "pushgateway"
+        honor_labels: true
+        static_configs:
+          - targets: ["pushgateway-np:9091"]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: victoriametrics-rules
+data:
+  hourly.yml: |-
+    groups:
+      - name: sensor_hourly_rollups
+        # Ejecutar la regla frecuentemente para tener datos fluidos
+        interval: 1m
+        rules:
+          - record: PM25:avg_1h
+            expr: avg_over_time(PM25[1h])
+
+          - record: PM25raw:avg_1h
+            expr: avg_over_time(PM25raw[1h])
+
+          - record: PM1:avg_1h
+            expr: avg_over_time(PM1[1h])
+
+          - record: Humidity:avg_1h
+            expr: avg_over_time(Humidity[1h])
+
+          - record: Temperature:avg_1h
+            expr: avg_over_time(Temperature[1h])
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: victoriametrics
+  labels:
+    app: victoriametrics
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: victoriametrics
+  template:
+    metadata:
+      labels:
+        app: victoriametrics
+    spec:
+      containers:
+        - name: victoriametrics
+          image: victoriametrics/victoria-metrics:v1.101.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--storageDataPath=/vm-data"
+            - "--retentionPeriod=5y"
+            - "--promscrape.config=/etc/vm/scrape.yml"
+          ports:
+            - containerPort: 8428
+              name: http
+          volumeMounts:
+            - name: vm-storage
+              mountPath: /vm-data
+            - name: vm-config
+              mountPath: /etc/vm
+              readOnly: true
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              # Limitado a 1.5Gi temporalmente mientras convive con Prometheus
+              cpu: "1500m"
+              memory: "1.5Gi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8428
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8428
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+      volumes:
+        - name: vm-storage
+          hostPath:
+            path: /data/victoriametrics
+            type: DirectoryOrCreate
+        - name: vm-config
+          configMap:
+            name: victoriametrics-scrape
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: victoriametrics-cip
+spec:
+  type: ClusterIP
+  selector:
+    app: victoriametrics
+  ports:
+    - name: http
+      port: 8428
+      targetPort: 8428
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: victoriametrics-cip-ext
+spec:
+  type: NodePort
+  selector:
+    app: victoriametrics
+  ports:
+    - name: http
+      port: 8428
+      targetPort: 8428
+      nodePort: 30001
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vmalert
+  labels:
+    app: vmalert
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vmalert
+  template:
+    metadata:
+      labels:
+        app: vmalert
+    spec:
+      containers:
+        - name: vmalert
+          image: victoriametrics/vmalert:v1.101.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--rule=/etc/vmalert/rules/hourly.yml"
+            - "--datasource.url=http://victoriametrics-cip:8428"
+            - "--remoteWrite.url=http://victoriametrics-cip:8428"
+            # Cambiado a 1m para evaluación constante
+            - "--evaluationInterval=1m"
+            - "--httpListenAddr=:8880"
+          ports:
+            - containerPort: 8880
+              name: http
+          volumeMounts:
+            - name: vmalert-rules
+              mountPath: /etc/vmalert/rules
+              readOnly: true
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+      volumes:
+        - name: vmalert-rules
+          configMap:
+            name: victoriametrics-rules
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vmalert-cip
+spec:
+  type: ClusterIP
+  selector:
+    app: vmalert
+  ports:
+    - name: http
+      port: 8880
+      targetPort: 8880
