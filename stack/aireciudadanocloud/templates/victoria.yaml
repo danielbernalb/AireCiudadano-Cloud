@@ -23,23 +23,68 @@ data:
   hourly.yml: |-
     groups:
       - name: sensor_hourly_rollups
-        # Ejecutar la regla frecuentemente para tener datos fluidos
         interval: 1m
         rules:
-          - record: PM25:avg_1h
+          # ==========================================
+          # VARIABLES (Requieren promedio horario)
+          # ==========================================
+          - record: PM25_1h
             expr: avg_over_time(PM25[1h])
-
-          - record: PM25raw:avg_1h
+            
+          - record: PM25raw_1h
             expr: avg_over_time(PM25raw[1h])
-
-          - record: PM1:avg_1h
+            
+          - record: PM251_1h
+            expr: avg_over_time(PM251[1h])
+            
+          - record: PM252_1h
+            expr: avg_over_time(PM252[1h])
+            
+          - record: PM1_1h
             expr: avg_over_time(PM1[1h])
-
-          - record: Humidity:avg_1h
+            
+          - record: VOC_1h
+            expr: avg_over_time(VOC[1h])
+            
+          - record: NOx_1h
+            expr: avg_over_time(NOx[1h])
+            
+          - record: Humidity_1h
             expr: avg_over_time(Humidity[1h])
-
-          - record: Temperature:avg_1h
+            
+          - record: Temperature_1h
             expr: avg_over_time(Temperature[1h])
+            
+          - record: RSSI_1h
+            expr: avg_over_time(RSSI[1h])
+            
+          - record: Var1_1h
+            expr: avg_over_time(Var1[1h])
+            
+          - record: Var2_1h
+            expr: avg_over_time(Var2[1h])
+            
+          - record: NoisePeak_1h
+            expr: avg_over_time(NoisePeak[1h])
+            
+          - record: Noise_1h
+            expr: avg_over_time(Noise[1h])
+
+          # ==========================================
+          # FIJAS (Solo extraemos el último valor de la hora)
+          # ==========================================
+          - record: Latitude_1h
+            expr: last_over_time(Latitude[1h])
+            
+          - record: Longitude_1h
+            expr: last_over_time(Longitude[1h])
+            
+          - record: InOut_1h
+            expr: last_over_time(InOut[1h])
+            
+          - record: ConfigVal_1h
+            expr: last_over_time(ConfigVal[1h])
+            
 ---
 apiVersion: apps/v1
 kind: Deployment
