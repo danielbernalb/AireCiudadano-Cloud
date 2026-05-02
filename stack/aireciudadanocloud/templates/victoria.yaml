@@ -1,4 +1,8 @@
-# victoriametrics-stack.yaml
+# victoria.yaml
+
+# ─────────────────────────────────────────────────────────────
+# 1. SCRAPE CONFIG — Lee Pushgateway igual que Prometheus
+# ─────────────────────────────────────────────────────────────
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,13 +12,16 @@ data:
     global:
       scrape_interval: 60s
       evaluation_interval: 180s
-
     scrape_configs:
       - job_name: "pushgateway"
         honor_labels: true
         static_configs:
           - targets: ["pushgateway-np:9091"]
+
 ---
+# ─────────────────────────────────────────────────────────────
+# 2. RECORDING RULES
+# ─────────────────────────────────────────────────────────────
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -23,69 +30,72 @@ data:
   hourly.yml: |-
     groups:
       - name: sensor_hourly_rollups
-        interval: 1m
+        # CRÍTICO: 1h — UN punto por hora, no 60
+        # El --evaluationInterval de vmalert también debe ser 1h
+        interval: 1h
         rules:
-          # ==========================================
-          # VARIABLES (Requieren promedio horario)
-          # ==========================================
+          # ── Promedios horarios ──────────────────────────────
           - record: PM25_1h
             expr: avg_over_time(PM25[1h])
-            
+
           - record: PM25raw_1h
             expr: avg_over_time(PM25raw[1h])
-            
+
           - record: PM251_1h
             expr: avg_over_time(PM251[1h])
-            
+
           - record: PM252_1h
             expr: avg_over_time(PM252[1h])
-            
+
           - record: PM1_1h
             expr: avg_over_time(PM1[1h])
-            
+
           - record: VOC_1h
             expr: avg_over_time(VOC[1h])
-            
+
           - record: NOx_1h
             expr: avg_over_time(NOx[1h])
-            
+
           - record: Humidity_1h
             expr: avg_over_time(Humidity[1h])
-            
+
           - record: Temperature_1h
             expr: avg_over_time(Temperature[1h])
-            
+
           - record: RSSI_1h
             expr: avg_over_time(RSSI[1h])
-            
+
           - record: Var1_1h
             expr: avg_over_time(Var1[1h])
-            
+
           - record: Var2_1h
             expr: avg_over_time(Var2[1h])
-            
+
           - record: NoisePeak_1h
             expr: avg_over_time(NoisePeak[1h])
-            
+
           - record: Noise_1h
             expr: avg_over_time(Noise[1h])
 
-          # ==========================================
-          # FIJAS (Solo extraemos el último valor de la hora)
-          # ==========================================
+          # ── Valores fijos: último valor de la hora ──────────
+          # last_over_time es correcto aquí — no tiene sentido
+          # promediar coordenadas ni flags de configuración
           - record: Latitude_1h
             expr: last_over_time(Latitude[1h])
-            
+
           - record: Longitude_1h
             expr: last_over_time(Longitude[1h])
-            
+
           - record: InOut_1h
             expr: last_over_time(InOut[1h])
-            
+
           - record: ConfigVal_1h
             expr: last_over_time(ConfigVal[1h])
-            
+
 ---
+# ─────────────────────────────────────────────────────────────
+# 3. VICTORIAMETRICS — Deployment principal
+# ─────────────────────────────────────────────────────────────
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -109,24 +119,41 @@ spec:
           args:
             - "--storageDataPath=/vm-data"
             - "--retentionPeriod=5y"
+
+            # Scrape del Pushgateway
             - "--promscrape.config=/etc/vm/scrape.yml"
+
+            # Protección contra queries pesadas de Grafana
+            # Sin esto una query de 2 años sobre datos raw colapsa VM
+            - "--search.maxQueryDuration=180s"
+            - "--search.maxConcurrentRequests=4"
+
+            # Caché: 60% de RAM disponible
+            - "--memory.allowedPercent=60"
+
           ports:
             - containerPort: 8428
               name: http
+
           volumeMounts:
             - name: vm-storage
               mountPath: /vm-data
             - name: vm-config
               mountPath: /etc/vm
               readOnly: true
+
           resources:
             requests:
-              cpu: "500m"
-              memory: "1Gi"
+              memory: "800Mi"
+              cpu: "200m"
+              ephemeral-storage: "1Gi"
             limits:
-              # Limitado a 1.5Gi temporalmente mientras convive con Prometheus
-              cpu: "1500m"
-              memory: "1.5Gi"
+              # Conservador mientras convive con Prometheus
+              # Aumentar a 1.6Gi/600m cuando Prometheus se apague
+              memory: "1.2Gi"
+              cpu: "400m"
+              ephemeral-storage: "1.5Gi"
+
           livenessProbe:
             httpGet:
               path: /health
@@ -141,6 +168,7 @@ spec:
             initialDelaySeconds: 10
             periodSeconds: 10
             timeoutSeconds: 5
+
       volumes:
         - name: vm-storage
           hostPath:
@@ -149,7 +177,11 @@ spec:
         - name: vm-config
           configMap:
             name: victoriametrics-scrape
+
 ---
+# ─────────────────────────────────────────────────────────────
+# 4. SERVICES — VictoriaMetrics
+# ─────────────────────────────────────────────────────────────
 apiVersion: v1
 kind: Service
 metadata:
@@ -176,7 +208,11 @@ spec:
       port: 8428
       targetPort: 8428
       nodePort: 30001
+
 ---
+# ─────────────────────────────────────────────────────────────
+# 5. VMALERT — Genera horarios de datos nuevos continuamente
+# ─────────────────────────────────────────────────────────────
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -201,27 +237,50 @@ spec:
             - "--rule=/etc/vmalert/rules/hourly.yml"
             - "--datasource.url=http://victoriametrics-cip:8428"
             - "--remoteWrite.url=http://victoriametrics-cip:8428"
-            # Cambiado a 1m para evaluación constante
-            - "--evaluationInterval=1m"
+            # CRÍTICO: debe coincidir con interval del grupo (1h)
+            # Si pones 1m aquí genera 60 puntos/hora en lugar de 1
+            - "--evaluationInterval=1h"
             - "--httpListenAddr=:8880"
+
           ports:
             - containerPort: 8880
               name: http
+
           volumeMounts:
             - name: vmalert-rules
               mountPath: /etc/vmalert/rules
               readOnly: true
+
           resources:
             requests:
-              cpu: "100m"
               memory: "128Mi"
+              cpu: "50m"
+              ephemeral-storage: "256Mi"
             limits:
-              cpu: "500m"
-              memory: "512Mi"
+              memory: "256Mi"
+              cpu: "200m"
+              ephemeral-storage: "512Mi"
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8880
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8880
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+
       volumes:
         - name: vmalert-rules
           configMap:
             name: victoriametrics-rules
+
 ---
 apiVersion: v1
 kind: Service
