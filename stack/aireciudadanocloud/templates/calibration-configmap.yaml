@@ -1,0 +1,298 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: calibration-config
+data:
+  calibration.yaml: |
+    # =====================================================
+    # TABLA DE CALIBRACIÓN PM25 — SENSORES CHS
+    # =====================================================
+    # Fórmula aplicada: ValorNuevo = round(ValorViejo * a + b)
+    #
+    # Reglas:
+    #   - Solo se calibran sensores cuyo nombre empiece por "CHS"
+    #   - Si un sensor CHS no aparece aquí, se usa a=1.0 y b=0.0
+    #     (sin corrección) y se emite un warning en los logs
+    #
+    # Para aplicar cambios SIN reiniciar el pod:
+    #   kubectl apply -f calibration-configmap.yaml
+    #   (el pod recarga el archivo automáticamente cada CLEANUP_INTERVAL segundos)
+    #
+    # Para aplicar cambios inmediatamente:
+    #   kubectl rollout restart deployment/pushgateway
+    # =====================================================
+
+    # --- CHS_31 ---
+    CHS_31_S1_V2:
+      a: 0.846
+      b: 3.315
+
+    # --- CHS_37 ---
+    CHS_37_P1_V2:
+      a: 0.535
+      b: 2.894
+    CHS_37_P2_V2:
+      a: 0.566
+      b: 2.136
+    CHS_37_S1_V2:
+      a: 1.286
+      b: 1.425
+
+    # --- CHS_57 ---
+    CHS_57_H_P1:
+      a: 0.61
+      b: -0.361
+    CHS_57_H_P2:
+      a: 0.574
+      b: -0.065
+    CHS_57_H_S1:
+      a: 0.79
+      b: 2.997
+
+    # --- CHS_58 ---
+    CHS_58_H_P1:
+      a: 0.598
+      b: 0.244
+    CHS_58_H_P2:
+      a: 0.583
+      b: 0.026
+    CHS_58_H_S1:
+      a: 0.944
+      b: 1.036
+
+    # --- CHS_59 ---
+    CHS_59_H_S1:
+      a: 0.79
+      b: 2.997
+
+    # --- CHS_60 ---
+    CHS_60_P1:
+      a: 0.456
+      b: 1.238
+    CHS_60_P2:
+      a: 0.405
+      b: 1.168
+    CHS_60_S1:
+      a: 0.795
+      b: 2.931
+
+    # --- CHS_62 ---
+    CHS_62_P1:
+      a: 0.553
+      b: 0.738
+    CHS_62_P2:
+      a: 0.52
+      b: 0.372
+    CHS_62_S1:
+      a: 1.061
+      b: 0.602
+
+    # --- CHS_63 ---
+    CHS_63_H_P1:
+      a: 0.47
+      b: 3.658
+    CHS_63_H_P2:
+      a: 0.477
+      b: 3.714
+    CHS_63_H_S1:
+      a: 0.988
+      b: 3.088
+
+    # --- CHS_64 ---
+    CHS_64_H_S1:
+      a: 0.892
+      b: 0.942
+
+    # --- CHS_65 ---
+    CHS_65_H_P1:
+      a: 0.494
+      b: 0.732
+    CHS_65_H_P2:
+      a: 0.493
+      b: 0.844
+    CHS_65_H_S1:
+      a: 0.802
+      b: 2.372
+
+    # --- CHS_66 ---
+    CHS_66_H_P1:
+      a: 0.591
+      b: 0.903
+    CHS_66_H_P2:
+      a: 0.553
+      b: 0.878
+    CHS_66_H_S1:
+      a: 1.026
+      b: 0.665
+
+    # --- CHS_67 ---
+    CHS_67_H_P1:
+      a: 0.525
+      b: 1.168
+    CHS_67_H_P2:
+      a: 0.532
+      b: 0.732
+    CHS_67_H_S1:
+      a: 0.888
+      b: 2.235
+
+    # --- CHS_68 ---
+    CHS_68_H_P1:
+      a: 0.519
+      b: 0.832
+    CHS_68_H_P2:
+      a: 0.516
+      b: 1.354
+    CHS_68_H_S1:
+      a: 0.858
+      b: 2.423
+
+    # --- CHS_69 ---
+    CHS_69_H_P1:
+      a: 0.549
+      b: 0.827
+    CHS_69_H_S1:
+      a: 0.947
+      b: 1.835
+
+    # --- CHS_70 ---
+    CHS_70_H_P1:
+      a: 0.446
+      b: 2.939
+    CHS_70_H_P2:
+      a: 0.439
+      b: 2.792
+
+    # --- CHS_71 ---
+    CHS_71_P1:
+      a: 0.794
+      b: 0.522
+
+    # --- CHS_73 ---
+    CHS_73_H_P1:
+      a: 0.44
+      b: 2.954
+    CHS_73_H_P2:
+      a: 0.474
+      b: 3.035
+    CHS_73_H_S1:
+      a: 1.032
+      b: 2.057
+
+    # --- CHS_74 ---
+    CHS_74_H_P1:
+      a: 0.522
+      b: 0.791
+    CHS_74_H_P2:
+      a: 0.528
+      b: 1.081
+    CHS_74_H_S1:
+      a: 0.898
+      b: 2.024
+
+    # --- CHS_79 ---
+    CHS_79_H_P1:
+      a: 0.548
+      b: 0.608
+    CHS_79_H_P2:
+      a: 0.542
+      b: 0.77
+    CHS_79_H_S1:
+      a: 1.044
+      b: 0.566
+
+    # --- CHS_80 ---
+    CHS_80_H_P1:
+      a: 0.47
+      b: 3.067
+    CHS_80_H_P2:
+      a: 0.51
+      b: 3.023
+    CHS_80_H_S1:
+      a: 1.031
+      b: 1.987
+
+    # --- CHS_81 ---
+    CHS_81_H_P1:
+      a: 0.47
+      b: 3.067
+    CHS_81_H_P2:
+      a: 0.51
+      b: 3.023
+    CHS_81_H_S1:
+      a: 1.031
+      b: 1.987
+
+    # --- CHS_82 ---
+    CHS_82_H_P1:
+      a: 0.555
+      b: 2.384
+    CHS_82_H_P2:
+      a: 0.571
+      b: 2.147
+    CHS_82_H_S1:
+      a: 1.296
+      b: 1.104
+
+    # --- CHS_83 ---
+    CHS_83_H_P1:
+      a: 0.535
+      b: 2.894
+    CHS_83_H_P2:
+      a: 0.566
+      b: 2.136
+    CHS_83_H_S1:
+      a: 1.286
+      b: 1.425
+
+    # --- CHS_84 ---
+    CHS_84_H_P1:
+      a: 0.631
+      b: 2.087
+    CHS_84_H_P2:
+      a: 0.585
+      b: 2.238
+    CHS_84_H_S1:
+      a: 1.295
+      b: 1.34
+
+    # --- CHS_85 ---
+    CHS_85_H_P1:
+      a: 0.546
+      b: 2.076
+    CHS_85_H_P2:
+      a: 0.539
+      b: 1.988
+    CHS_85_H_S1:
+      a: 1.18
+      b: 1.135
+
+    # --- CHS_86 ---
+    CHS_86_H_P1:
+      a: 0.606
+      b: 1.746
+    CHS_86_H_P2:
+      a: 0.608
+      b: 1.48
+    CHS_86_H_S1:
+      a: 1.048
+      b: 1.757
+
+    # --- CHS_87 ---
+    CHS_87_H_P1:
+      a: 0.576
+      b: 2.272
+    CHS_87_H_P2:
+      a: 0.598
+      b: 2.208
+    CHS_87_H_S1:
+      a: 0.979
+      b: 2.37
+
+    # --- CHS_88 ---
+    CHS_88_H_P1:
+      a: 0.391
+      b: 4.137
+    CHS_88_H_P2:
+      a: 0.437
+      b: 4.707
