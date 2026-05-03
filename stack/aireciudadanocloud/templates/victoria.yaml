@@ -142,16 +142,7 @@ spec:
               readOnly: true
 
           resources:
-            requests:
-              memory: "800Mi"
-              cpu: "200m"
-              ephemeral-storage: "1Gi"
-            limits:
-              # Conservador mientras convive con Prometheus
-              # Aumentar a 1.6Gi/600m cuando Prometheus se apague
-              memory: "1.2Gi"
-              cpu: "400m"
-              ephemeral-storage: "1.5Gi"
+            {{- toYaml .Values.resources.victoria | nindent 12 }}
 
           livenessProbe:
             httpGet:
@@ -251,14 +242,7 @@ spec:
               readOnly: true
 
           resources:
-            requests:
-              memory: "128Mi"
-              cpu: "50m"
-              ephemeral-storage: "256Mi"
-            limits:
-              memory: "256Mi"
-              cpu: "200m"
-              ephemeral-storage: "512Mi"
+            {{- toYaml .Values.resources.vmalert | nindent 12 }}
 
           livenessProbe:
             httpGet:

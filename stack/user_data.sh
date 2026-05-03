@@ -10,7 +10,7 @@ export PUBLIC_IP=sensor.aireciudadano.com
 export GRAFANA_ADMIN_PASSWORD="daniel2022"
 
 #==============Initialize /data if needed===================
-for application in prometheus pushgatewaypython grafana mosquitto letsencrypt
+for application in prometheus pushgatewaypython grafana mosquitto letsencrypt victoria vmalert
 do
     if [ ! -d /data/$application ]; then
         sudo mkdir -p /data/$application
@@ -32,7 +32,7 @@ curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
 
 #================Restore data and install stack=================
 cd $HOME
-git clone --branch cambios42_1mayo2026_altPMraw https://github.com/danielbernalb/aireciudadano-cloud.git
+git clone --branch cambios43_2mayo2026_vm https://github.com/danielbernalb/aireciudadano-cloud.git
 # Instalar el stack con Helm
 helm install --set tls=true --set publicIP=$PUBLIC_IP --set grafanaAdminPass=$GRAFANA_ADMIN_PASSWORD aireciudadanostack aireciudadano-cloud/stack/aireciudadanocloud
 #===========================================================

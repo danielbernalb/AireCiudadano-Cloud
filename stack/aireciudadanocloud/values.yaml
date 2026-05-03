@@ -24,41 +24,80 @@ resources:
     requests:
       memory: "200Mi"
       cpu: "120m"
+      ephemeral-storage: "50Mi"
     limits:
       memory: "250Mi"
       cpu: "200m"
+      ephemeral-storage: "100Mi" # Muy ligero, no guarda archivos pesados
+
   pushgatewaypython:
     requests:
       memory: "250Mi"
       cpu: "200m"
+      ephemeral-storage: "100Mi"
     limits:
       memory: "400Mi"
       cpu: "300m"
+      ephemeral-storage: "250Mi" # Un poco de margen para procesamiento temporal
+
   prometheus:
     requests:
       memory: "800Mi"
       cpu: "250m"
+      ephemeral-storage: "500Mi"
     limits:
       memory: "1Gi"
       cpu: "400m"
+      ephemeral-storage: "1Gi" # Por si acaso genera logs pesados antes de que lo apagues
+
   grafana:
     requests:
       memory: "400Mi"
       cpu: "200m"
+      ephemeral-storage: "250Mi"
     limits:
       memory: "500Mi"
       cpu: "250m"
+      ephemeral-storage: "500Mi" # Grafana usa espacio local para caché de paneles y plugins
+
   apiserver:
     requests:
       memory: "100Mi"
       cpu: "100m"
+      ephemeral-storage: "50Mi"
     limits:
       memory: "150Mi"
       cpu: "120m"
+      ephemeral-storage: "150Mi" # API sencilla, no necesita casi nada de disco temporal
+
   nginx:
     requests:
       memory: "150Mi"
       cpu: "100m"
+      ephemeral-storage: "100Mi"
     limits:
       memory: "200Mi"
       cpu: "250m"
+      ephemeral-storage: "250Mi" # Nginx necesita espacio por si hace caché de peticiones web
+
+  victoria:
+    requests:
+      memory: "800Mi"
+      cpu: "200m"
+      ephemeral-storage: "1Gi"
+    limits:
+    # Conservador mientras convive con Prometheus
+    # Aumentar a 1.6Gi/600m cuando Prometheus se apague
+      memory: "1.2Gi"
+      cpu: "400m"
+      ephemeral-storage: "1.5Gi"
+
+  vmalert:
+    requests:
+      memory: "128Mi"
+      cpu: "50m"
+      ephemeral-storage: "256Mi"
+    limits:
+      memory: "256Mi"
+      cpu: "200m"
+      ephemeral-storage: "512Mi"
