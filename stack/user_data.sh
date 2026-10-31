@@ -32,7 +32,7 @@ curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
 
 #================Restore data and install stack=================
 cd $HOME
-git clone --branch cambios43_2mayo2026_vm https://github.com/danielbernalb/aireciudadano-cloud.git
+git clone --branch cambios45_30oct2026_vm https://github.com/danielbernalb/aireciudadano-cloud.git
 # Instalar el stack con Helm
 helm install --set tls=true --set publicIP=$PUBLIC_IP --set grafanaAdminPass=$GRAFANA_ADMIN_PASSWORD aireciudadanostack aireciudadano-cloud/stack/aireciudadanocloud
 #===========================================================
