@@ -119,10 +119,12 @@ spec:
           imagePullPolicy: IfNotPresent
           args:
             - "--storageDataPath=/vm-data"
-            - "--retentionPeriod=5y"
+            - "--retentionPeriod=10y"
 
             # Scrape del Pushgateway
             - "--promscrape.config=/etc/vm/scrape.yml"
+
+            - "--promscrape.config.strictParse=false"
 
             # Protección contra queries pesadas de Grafana
             # Sin esto una query de 2 años sobre datos raw colapsa VM

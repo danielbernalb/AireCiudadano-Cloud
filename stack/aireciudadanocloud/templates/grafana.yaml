@@ -30,14 +30,6 @@ spec:
           {{- else }}
             value: "http://{{ .Values.publicIP }}"
           {{- end }}
-          - name: GF_RENDERING_SERVER_URL
-            value: "http://grafana-image-renderer-cip:8081/render"
-          - name: GF_RENDERING_CALLBACK_URL
-          {{- if .Values.secondaryPublicIP }}
-            value: "http://{{ .Values.secondaryPublicIP }}/"
-          {{- else }}
-            value: "http://{{ .Values.publicIP }}/"
-          {{- end }}
           - name: GF_LOG_FILTERS
             value: rendering:debug
           - name: GF_INSTALL_PLUGINS
